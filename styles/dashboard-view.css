@@ -60,6 +60,21 @@
 	margin-bottom: 4px;
 }
 
+.dashboard-v2__goal-list-controls > .dashboard-v2__subtle-button:first-child {
+	display: none;
+}
+
+.dashboard-v2__panel--goals > .dashboard-v2__panel-actions {
+	display: none;
+}
+
+.dashboard-v2__goals-top-left,
+.dashboard-v2__goals-top-right {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+}
+
 .dashboard-v2__task-stream--cards {
 	gap: 8px;
 }

@@ -321,8 +321,9 @@ export class DashboardView extends ItemView {
 		if (!this.dashboardData) return;
 		const card = container.createDiv({ cls: "dashboard-v2__panel dashboard-v2__panel--goals" });
 		const top = card.createDiv({ cls: "dashboard-v2__panel-top" });
-		top.createDiv({ cls: "dashboard-v2__eyebrow", text: "Goals" });
-		top.appendChild(
+		const topLeft = top.createDiv({ cls: "dashboard-v2__goals-top-left" });
+		topLeft.createDiv({ cls: "dashboard-v2__eyebrow", text: "Goals" });
+		topLeft.appendChild(
 			this.createSelectControl(
 				[
 					{ value: "today", label: "Цели на сегодня" },
@@ -337,6 +338,19 @@ export class DashboardView extends ItemView {
 				"dashboard-v2__select dashboard-v2__select--compact"
 			)
 		);
+		const topRight = top.createDiv({ cls: "dashboard-v2__goals-top-right" });
+		const createTopButton = topRight.createEl("button", {
+			cls: "dashboard-v2__subtle-button",
+			text: "РќРѕРІР°СЏ С†РµР»СЊ",
+			attr: { "aria-label": "Create goal" },
+		});
+		this.registerDomEvent(createTopButton, "click", () => {
+			const periodType: GoalPeriodType = this.goalScope === "today" ? "week" : this.goalScope;
+			this.plugin.openGoalCreationModal({
+				periodType,
+				referenceDate: this.selectedDate,
+			});
+		});
 
 		const goals = this.getGoalItemsForScope(this.dashboardData.goalGroups, this.goalScope);
 		if (goals.length === 0) {
@@ -942,7 +956,7 @@ export class DashboardView extends ItemView {
 			return goals;
 		}
 
-		return goals.slice(this.goalListOffset, this.goalListOffset + 3);
+		return goals.slice(0, 3);
 	}
 
 	private applyTaskVisibilityFilter(tasks: TaskInfo[]): TaskInfo[] {
