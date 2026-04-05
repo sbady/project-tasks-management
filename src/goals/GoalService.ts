@@ -1,4 +1,4 @@
-import { Notice, TFile, stringifyYaml } from "obsidian";
+import { Notice, TFile, normalizePath, stringifyYaml } from "obsidian";
 import type TaskNotesPlugin from "../main";
 import type { GoalCreationData, GoalInfo } from "../types";
 import { EVENT_DATA_CHANGED } from "../types";
@@ -6,6 +6,7 @@ import { getGoalFolderPath, getGoalNotePath } from "../core/pathing/goalPaths";
 import type { GoalPeriodDescriptor } from "./GoalPeriodService";
 import { getCurrentTimestamp, parseDateAsLocal } from "../utils/dateUtils";
 import { ensureFolderExists } from "../utils/helpers";
+import { normalizeEntityLink } from "../core/links/normalizeEntityLink";
 
 export interface GoalCreateResult {
 	file: TFile;
@@ -34,24 +35,14 @@ export class GoalService {
 			referenceDate
 		);
 		const folderPath = getGoalFolderPath(this.plugin.settings, descriptor.periodType);
-		const notePath = getGoalNotePath(
+		const baseNotePath = getGoalNotePath(
 			this.plugin.settings,
 			descriptor.periodType,
 			descriptor.periodKey
 		);
-		const existingFile = this.plugin.app.vault.getAbstractFileByPath(notePath);
-		if (existingFile instanceof TFile) {
-			const goal =
-				this.plugin.goalRepository.getGoal(existingFile.path) ??
-				this.buildGoalInfo(goalData, existingFile.path, descriptor, getCurrentTimestamp(), getCurrentTimestamp());
-			if (openAfterCreate) {
-				await this.openFile(existingFile);
-			}
-			return { file: existingFile, goal, created: false };
-		}
-
 		const now = getCurrentTimestamp();
 		await ensureFolderExists(this.plugin.app.vault, folderPath);
+		const notePath = this.getUniqueGoalNotePath(baseNotePath);
 		const goal = this.buildGoalInfo(goalData, notePath, descriptor, now, now);
 		const file = await this.plugin.app.vault.create(notePath, this.serializeGoal(goal));
 
@@ -111,6 +102,36 @@ export class GoalService {
 		return updatedGoal;
 	}
 
+	async syncTaskGoal(taskPath: string, goalPath?: string): Promise<void> {
+		const normalizedTaskPath = normalizePath(taskPath);
+		const normalizedGoalPath = goalPath ? normalizePath(goalPath) : "";
+		const taskLink = `[[${normalizedTaskPath.replace(/\.md$/i, "")}]]`;
+		const goals = this.plugin.goalRepository.listGoals();
+
+		for (const goal of goals) {
+			const relatedTasks = goal.relatedTasks ?? [];
+			const containsTask = relatedTasks.some(
+				(link) => this.resolveLinkedPath(link) === normalizedTaskPath
+			);
+			const shouldContainTask = normalizedGoalPath !== "" && normalizePath(goal.path) === normalizedGoalPath;
+
+			if (shouldContainTask && !containsTask) {
+				await this.updateGoal(goal, {
+					relatedTasks: [...relatedTasks, taskLink],
+				});
+				continue;
+			}
+
+			if (!shouldContainTask && containsTask) {
+				await this.updateGoal(goal, {
+					relatedTasks: relatedTasks.filter(
+						(link) => this.resolveLinkedPath(link) !== normalizedTaskPath
+					),
+				});
+			}
+		}
+	}
+
 	private buildGoalInfo(
 		goalData: Partial<GoalInfo>,
 		path: string,
@@ -154,6 +175,28 @@ export class GoalService {
 		this.setOrDelete(frontmatter, "relatedNotes", goal.relatedNotes);
 
 		return `---\n${stringifyYaml(frontmatter)}---\n\n`;
+	}
+
+	private getUniqueGoalNotePath(basePath: string): string {
+		const normalizedBasePath = normalizePath(basePath);
+		const existingFile = this.plugin.app.vault.getAbstractFileByPath(normalizedBasePath);
+		if (!(existingFile instanceof TFile)) {
+			return normalizedBasePath;
+		}
+
+		const extensionIndex = normalizedBasePath.lastIndexOf(".");
+		const baseWithoutExtension =
+			extensionIndex >= 0 ? normalizedBasePath.slice(0, extensionIndex) : normalizedBasePath;
+		const extension = extensionIndex >= 0 ? normalizedBasePath.slice(extensionIndex) : ".md";
+
+		let counter = 2;
+		let candidate = `${baseWithoutExtension}-${counter}${extension}`;
+		while (this.plugin.app.vault.getAbstractFileByPath(candidate) instanceof TFile) {
+			counter += 1;
+			candidate = `${baseWithoutExtension}-${counter}${extension}`;
+		}
+
+		return normalizePath(candidate);
 	}
 
 	private normalizeOptionalString(
@@ -221,5 +264,17 @@ export class GoalService {
 		}
 
 		new Notice("Goal note created, but it could not be opened automatically.");
+	}
+
+	private resolveLinkedPath(link: string): string {
+		const normalized = normalizeEntityLink(link);
+		if (!normalized) return "";
+
+		const linkPath = normalized.replace(/\.md$/i, "");
+		const metadataCache = this.plugin.app.metadataCache as {
+			getFirstLinkpathDest?: (linkpath: string, sourcePath: string) => { path: string } | null;
+		};
+		const resolved = metadataCache.getFirstLinkpathDest?.(linkPath, "");
+		return normalizePath(resolved?.path ?? normalized);
 	}
 }

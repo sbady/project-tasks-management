@@ -39,6 +39,12 @@ export class GoalRepository {
 		);
 	}
 
+	listGoalsForPeriod(periodType: GoalPeriodType, periodKey: string): GoalInfo[] {
+		return this.listGoals(periodType).filter(
+			(goal) => goal.periodType === periodType && goal.periodKey === periodKey
+		);
+	}
+
 	getCurrentGoal(periodType: GoalPeriodType, date: Date = new Date()): GoalInfo | null {
 		const descriptor = this.goalPeriodService.getPeriodDescriptor(periodType, date);
 		return this.getGoalForPeriod(periodType, descriptor.periodKey);

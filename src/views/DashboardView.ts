@@ -41,7 +41,7 @@ export class DashboardView extends ItemView {
 	private focusTaskPath = "";
 	private plannerMode: DashboardPlannerMode = "today";
 	private progressScope: DashboardProgressScope = "today";
-	private goalScope: DashboardGoalScopeLocal = "month";
+	private goalScope: DashboardGoalScopeLocal = "week";
 	private projectSort: DashboardProjectSort = "due";
 	private projectStatusFilter = "all";
 	private taskVisibilityFilter: TaskVisibilityFilter = "open";
@@ -548,15 +548,15 @@ export class DashboardView extends ItemView {
 			void this.refresh();
 		});
 
-		header.createDiv({
-			cls: "dashboard-v2__planner-range-label",
-			text: this.formatPlannerWeekRange(groups[0].date, groups[groups.length - 1].date),
-		});
-
 		const nextButton = this.createIconButton(nav, "chevron-right", "Next week");
 		this.registerDomEvent(nextButton, "click", () => {
 			this.selectedDate = format(addDays(parseDateAsLocal(this.selectedDate), 7), "yyyy-MM-dd");
 			void this.refresh();
+		});
+
+		header.createDiv({
+			cls: "dashboard-v2__planner-range-label",
+			text: this.formatPlannerWeekRange(groups[0].date, groups[groups.length - 1].date),
 		});
 	}
 
@@ -1222,7 +1222,7 @@ export class DashboardView extends ItemView {
 		const rightIndex = priorities.findIndex((item) => item.value === right);
 		const leftRank = leftIndex === -1 ? priorities.length + 1 : leftIndex;
 		const rightRank = rightIndex === -1 ? priorities.length + 1 : rightIndex;
-		return leftRank - rightRank;
+		return rightRank - leftRank;
 	}
 
 	private compareStatuses(left: string, right: string): number {

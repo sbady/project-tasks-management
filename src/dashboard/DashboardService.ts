@@ -70,13 +70,13 @@ export class DashboardService {
 		const quarterDescriptor = this.plugin.goalPeriodService.getPeriodDescriptor("quarter", today);
 		const tasks = await this.plugin.cacheManager.getAllTasks();
 		const incompleteTasks = tasks.filter((task) => !this.isTaskCompleted(task));
-		const todayTasks = this.getTasksForDate(incompleteTasks, plannerReferenceDate);
+		const todayTasks = this.getTasksForDate(incompleteTasks, today);
 		const plannerWeekStart = startOfWeek(plannerReferenceDate, { weekStartsOn: 1 });
 		const weekGroups = this.buildWeekGroups(incompleteTasks, plannerWeekStart);
 		const currentGoals = {
-			week: this.plugin.goalRepository.getCurrentGoal("week", today),
-			month: this.plugin.goalRepository.getCurrentGoal("month", today),
-			quarter: this.plugin.goalRepository.getCurrentGoal("quarter", today),
+			week: this.plugin.goalRepository.listGoalsForPeriod("week", weekDescriptor.periodKey),
+			month: this.plugin.goalRepository.listGoalsForPeriod("month", monthDescriptor.periodKey),
+			quarter: this.plugin.goalRepository.listGoalsForPeriod("quarter", quarterDescriptor.periodKey),
 		};
 
 		const sectionsById = new Map<DashboardSectionId, DashboardSection>([
@@ -100,7 +100,7 @@ export class DashboardService {
 			currentWeekKey: weekDescriptor.periodKey,
 			currentMonthKey: monthDescriptor.periodKey,
 			currentQuarterKey: quarterDescriptor.periodKey,
-			focus: this.buildFocusPayload(todayTasks, currentGoals.week, currentGoals.month),
+			focus: this.buildFocusPayload(todayTasks, currentGoals.week[0] ?? null, currentGoals.month[0] ?? null),
 			progress: this.buildProgressPayload(tasks, today, weekStart, weekEnd),
 			goalGroups: this.buildGoalGroupsPayload(tasks, today, weekStart, weekEnd),
 			planner: {
@@ -208,15 +208,17 @@ export class DashboardService {
 		weekEnd: Date
 	): DashboardGoalGroupsPayload {
 		const allGoals = this.plugin.goalRepository.listGoals();
-		const weekGoal = this.plugin.goalRepository.getCurrentGoal("week", today);
-		const monthGoal = this.plugin.goalRepository.getCurrentGoal("month", today);
+		const currentWeekKey = this.plugin.goalPeriodService.getPeriodDescriptor("week", today).periodKey;
+		const currentMonthKey = this.plugin.goalPeriodService.getPeriodDescriptor("month", today).periodKey;
+		const weekGoals = this.plugin.goalRepository.listGoalsForPeriod("week", currentWeekKey);
+		const monthGoals = this.plugin.goalRepository.listGoalsForPeriod("month", currentMonthKey);
 
 		return {
 			today: allGoals
 				.map((goal) => this.buildGoalProgressItem(goal, tasks, today, weekStart, weekEnd))
 				.filter((item) => item && item.activeTasksToday > 0) as DashboardGoalProgressItem[],
-			week: weekGoal ? [this.buildGoalProgressItem(weekGoal, tasks, today, weekStart, weekEnd)] : [],
-			month: monthGoal ? [this.buildGoalProgressItem(monthGoal, tasks, today, weekStart, weekEnd)] : [],
+			week: weekGoals.map((goal) => this.buildGoalProgressItem(goal, tasks, today, weekStart, weekEnd)),
+			month: monthGoals.map((goal) => this.buildGoalProgressItem(goal, tasks, today, weekStart, weekEnd)),
 		};
 	}
 
@@ -252,7 +254,7 @@ export class DashboardService {
 		const projects = this.plugin.projectRepository
 			.listProjects()
 			.map((project) => this.buildProjectBoardItem(project, tasks))
-			.filter((item) => item.totalTasks > 0 || !this.isProjectClosed(item.project));
+			.filter((item) => item.totalTasks > 0);
 
 		const availableStatuses = Array.from(
 			new Set(projects.map((item) => item.project.status).filter((value) => !!value))
@@ -572,7 +574,7 @@ export class DashboardService {
 			const leftRank = this.getPriorityRank(left.priority);
 			const rightRank = this.getPriorityRank(right.priority);
 			if (leftRank !== rightRank) {
-				return leftRank - rightRank;
+				return rightRank - leftRank;
 			}
 
 			const leftDate = left.scheduled || left.due || "9999-99-99";
