@@ -341,7 +341,7 @@ export class DashboardView extends ItemView {
 			});
 		} else {
 			const list = card.createDiv({ cls: "dashboard-v2__goal-list" });
-			for (const item of goals.slice(0, 4)) {
+			for (const item of goals) {
 				this.renderGoalItem(list, item);
 			}
 		}
