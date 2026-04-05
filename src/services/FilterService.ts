@@ -2116,8 +2116,10 @@ export class FilterService extends EventEmitter {
 		baseQuery: FilterQuery,
 		includeOverdue = false
 	): Promise<TaskInfo[]> {
-		// FIXED: Use UTC Anchor principle for consistent date handling
-		const dateStr = formatDateForStorage(date);
+		// Use the local calendar date for agenda matching.
+		// Agenda/day views are user-facing local-date contexts, so UTC conversion
+		// can shift "today" backward in positive-offset timezones.
+		const dateStr = format(date, "yyyy-MM-dd");
 		const isViewingToday = isTodayUtil(dateStr);
 
 		// Get all tasks and filter using new system

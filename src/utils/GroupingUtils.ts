@@ -35,9 +35,9 @@ export class GroupingUtils {
 			case "No Project":
 				return "No Project";
 			case "No Due Date":
-				return "No Due Date";
+				return "No deadline";
 			case "No Scheduled Date":
-				return "No Scheduled Date";
+				return "No plan";
 			default:
 				// For project names that may come from consolidation, return as-is
 				// since they should already be cleaned by FilterService.consolidateProjectName

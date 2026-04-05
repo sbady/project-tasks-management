@@ -13,6 +13,17 @@
 }
 
 .dashboard-v2__header,
+.dashboard-v2__top-grid,
+.dashboard-v2__panel--planner,
+.dashboard-v2__panel--projects,
+.dashboard-v2__capture {
+	width: 100%;
+	max-width: 1180px;
+	box-sizing: border-box;
+	align-self: center;
+}
+
+.dashboard-v2__header,
 .dashboard-v2__panel,
 .dashboard-v2__capture {
 	position: relative;
@@ -40,6 +51,14 @@
 	display: flex;
 	flex-direction: column;
 	gap: 10px;
+}
+
+.dashboard-v2__task-stream--cards {
+	gap: 8px;
+}
+
+.dashboard-v2__planner-card {
+	width: 100%;
 }
 
 .dashboard-v2__title {
@@ -155,7 +174,6 @@
 	grid-template-columns: minmax(250px, 1fr) minmax(210px, 0.72fr) minmax(280px, 1fr);
 	gap: 14px;
 	align-items: start;
-	max-width: 1180px;
 }
 
 .dashboard-v2__panel-top,
@@ -172,6 +190,24 @@
 
 .dashboard-v2__panel-top {
 	margin-bottom: 10px;
+}
+
+.dashboard-v2__planner-range {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 10px;
+	margin-top: -2px;
+	margin-bottom: 6px;
+}
+
+.dashboard-v2__planner-range-label {
+	flex: 1;
+	text-align: center;
+	font-size: 13px;
+	font-weight: 650;
+	letter-spacing: -0.01em;
+	color: var(--text-normal);
 }
 
 .dashboard-v2__eyebrow,
@@ -317,7 +353,6 @@
 	display: flex;
 	flex-direction: column;
 	gap: 10px;
-	max-width: 1180px;
 }
 
 .dashboard-v2__task-row {
@@ -463,9 +498,23 @@
 
 .dashboard-v2__capture-controls {
 	display: grid;
-	grid-template-columns: minmax(0, 1fr) 180px 180px auto;
+	grid-template-columns: minmax(0, 1fr) auto;
 	gap: 8px;
 	align-items: center;
+}
+
+.dashboard-v2__capture-selectors {
+	display: grid;
+	grid-template-columns: minmax(0, 0.9fr) minmax(180px, 240px);
+	gap: 8px;
+	align-items: center;
+	min-width: 0;
+}
+
+.dashboard-v2__capture-actions {
+	flex-wrap: nowrap;
+	justify-content: flex-end;
+	flex-shrink: 0;
 }
 
 .dashboard-v2__select {
@@ -515,6 +564,10 @@
 	}
 
 	.dashboard-v2__capture-controls {
+		grid-template-columns: 1fr;
+	}
+
+	.dashboard-v2__capture-selectors {
 		grid-template-columns: 1fr 1fr;
 	}
 
@@ -559,6 +612,14 @@
 
 	.dashboard-v2__capture-controls {
 		grid-template-columns: 1fr;
+	}
+
+	.dashboard-v2__capture-selectors {
+		grid-template-columns: 1fr;
+	}
+
+	.dashboard-v2__capture-actions {
+		justify-content: flex-start;
 	}
 
 	.dashboard-v2__quick-panel {

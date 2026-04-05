@@ -460,7 +460,7 @@ ${formulasSection}
 
 views:
   - type: tasknotesMiniCalendar
-    name: "Plan"
+name: "Plan"
     order:
 ${miniCalendarOrder}
     sort:
@@ -469,7 +469,7 @@ ${miniCalendarOrder}
     dateProperty: formula.nextDate
     titleProperty: file.name
   - type: tasknotesMiniCalendar
-    name: "Scheduled"
+name: "Plan date"
     order:
 ${miniCalendarOrder}
     sort:
@@ -478,7 +478,7 @@ ${miniCalendarOrder}
     dateProperty: ${scheduledProperty}
     titleProperty: file.name
   - type: tasknotesMiniCalendar
-    name: "Due"
+name: "Deadline"
     order:
 ${miniCalendarOrder}
     sort:

@@ -516,11 +516,35 @@ export abstract class BasesViewBase extends Component {
 			const taskCardPropertyId = this.propertyMapper.basesToTaskCardProperty(basesPropertyId);
 			const displayName = this.config.getDisplayName?.(basesPropertyId);
 			if (taskCardPropertyId && typeof displayName === "string" && displayName.trim() !== "") {
-				labels[taskCardPropertyId] = displayName;
+				labels[taskCardPropertyId] = this.normalizeVisiblePropertyLabel(
+					taskCardPropertyId,
+					displayName
+				);
 			}
 		}
 
 		return labels;
+	}
+
+	private normalizeVisiblePropertyLabel(taskCardPropertyId: string, displayName: string): string {
+		const trimmed = displayName.trim();
+		const normalized = trimmed.toLowerCase();
+
+		if (
+			taskCardPropertyId === "due" &&
+			(normalized === "due" || normalized === "due date")
+		) {
+			return this.plugin.i18n.translate("ui.taskCard.labels.due");
+		}
+
+		if (
+			taskCardPropertyId === "scheduled" &&
+			(normalized === "scheduled" || normalized === "scheduled date")
+		) {
+			return this.plugin.i18n.translate("ui.taskCard.labels.scheduled");
+		}
+
+		return trimmed;
 	}
 
 	protected buildTaskCardOptions(

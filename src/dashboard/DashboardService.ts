@@ -54,6 +54,7 @@ export class DashboardService {
 
 	async getDashboardData(selectedDate = getTodayString()): Promise<DashboardData> {
 		const today = getTodayLocal();
+		const plannerReferenceDate = selectedDate ? parseDateAsLocal(selectedDate) : today;
 		const weekStartsOn = (this.plugin.settings.calendarViewSettings.firstDay || 1) as
 			| 0
 			| 1
@@ -69,8 +70,9 @@ export class DashboardService {
 		const quarterDescriptor = this.plugin.goalPeriodService.getPeriodDescriptor("quarter", today);
 		const tasks = await this.plugin.cacheManager.getAllTasks();
 		const incompleteTasks = tasks.filter((task) => !this.isTaskCompleted(task));
-		const todayTasks = this.getTasksForDate(incompleteTasks, today);
-		const weekGroups = this.buildWeekGroups(incompleteTasks, weekStart);
+		const todayTasks = this.getTasksForDate(incompleteTasks, plannerReferenceDate);
+		const plannerWeekStart = startOfWeek(plannerReferenceDate, { weekStartsOn: 1 });
+		const weekGroups = this.buildWeekGroups(incompleteTasks, plannerWeekStart);
 		const currentGoals = {
 			week: this.plugin.goalRepository.getCurrentGoal("week", today),
 			month: this.plugin.goalRepository.getCurrentGoal("month", today),
@@ -94,7 +96,7 @@ export class DashboardService {
 
 		return {
 			generatedAt: getCurrentTimestamp(),
-			currentDate: getTodayString(),
+			currentDate: format(plannerReferenceDate, "yyyy-MM-dd"),
 			currentWeekKey: weekDescriptor.periodKey,
 			currentMonthKey: monthDescriptor.periodKey,
 			currentQuarterKey: quarterDescriptor.periodKey,
@@ -140,7 +142,7 @@ export class DashboardService {
 		weekGoal: GoalInfo | null,
 		monthGoal: GoalInfo | null
 	): DashboardFocusPayload {
-		const focusTask = this.sortTasksByPriorityAndDate(todayTasks)[0];
+		const focusTask = todayTasks[0];
 		if (focusTask) {
 			return {
 				title: focusTask.title,
@@ -206,7 +208,6 @@ export class DashboardService {
 		weekEnd: Date
 	): DashboardGoalGroupsPayload {
 		const allGoals = this.plugin.goalRepository.listGoals();
-		const todayTaskPaths = new Set(this.getTasksForDate(tasks.filter((task) => !this.isTaskCompleted(task)), today).map((task) => normalizePath(task.path)));
 		const weekGoal = this.plugin.goalRepository.getCurrentGoal("week", today);
 		const monthGoal = this.plugin.goalRepository.getCurrentGoal("month", today);
 
@@ -245,22 +246,6 @@ export class DashboardService {
 			activeTasksToday,
 			activeTasksThisWeek,
 		};
-	}
-
-	private buildWeekGroups(tasks: TaskInfo[], weekStart: Date): DashboardPlannerDayGroup[] {
-		const groups: DashboardPlannerDayGroup[] = [];
-
-		for (let index = 0; index < 7; index += 1) {
-			const day = addDays(weekStart, index);
-			const dayTasks = this.getTasksForDate(tasks, day);
-			groups.push({
-				date: format(day, "yyyy-MM-dd"),
-				label: format(day, "EEEE, d MMM"),
-				tasks: dayTasks,
-			});
-		}
-
-		return groups;
 	}
 
 	private buildProjectsBoardPayload(tasks: TaskInfo[], today: Date): DashboardProjectsPayload {
@@ -438,6 +423,7 @@ export class DashboardService {
 		const monthStart = startOfMonth(calendarDate);
 		const monthEnd = endOfMonth(calendarDate);
 		const markers: Record<string, number> = {};
+		const incompleteTasks = tasks.filter((task) => !this.isTaskCompleted(task));
 
 		for (const task of tasks) {
 			for (const taskDate of [task.scheduled, task.due]) {
@@ -456,6 +442,7 @@ export class DashboardService {
 		return {
 			selectedDate,
 			markers,
+			selectedTasks: this.getTasksForDate(incompleteTasks, calendarDate),
 		};
 	}
 
@@ -507,49 +494,6 @@ export class DashboardService {
 		};
 	}
 
-	private getTasksForDate(tasks: TaskInfo[], date: Date): TaskInfo[] {
-		const dateKey = format(date, "yyyy-MM-dd");
-		const seen = new Set<string>();
-		const result: TaskInfo[] = [];
-
-		for (const task of this.sortTasksByPriorityAndDate(tasks)) {
-			const matchesScheduled = getDatePart(task.scheduled || "") === dateKey;
-			const matchesDue = getDatePart(task.due || "") === dateKey;
-			if ((matchesScheduled || matchesDue) && !seen.has(task.path)) {
-				result.push(task);
-				seen.add(task.path);
-			}
-		}
-
-		return result;
-	}
-
-	private sortTasksByPriorityAndDate(tasks: TaskInfo[]): TaskInfo[] {
-		return [...tasks].sort((left, right) => {
-			const leftRank = this.getPriorityRank(left.priority);
-			const rightRank = this.getPriorityRank(right.priority);
-			if (leftRank !== rightRank) {
-				return leftRank - rightRank;
-			}
-
-			const leftDate = left.scheduled || left.due || "9999-99-99";
-			const rightDate = right.scheduled || right.due || "9999-99-99";
-			if (leftDate !== rightDate) {
-				return leftDate.localeCompare(rightDate);
-			}
-
-			return left.title.localeCompare(right.title);
-		});
-	}
-
-	private getPriorityRank(priority: string): number {
-		const priorities = [...(this.plugin.settings.customPriorities || [])].sort(
-			(left, right) => left.weight - right.weight
-		);
-		const index = priorities.findIndex((item) => item.value === priority);
-		return index === -1 ? priorities.length + 1 : index;
-	}
-
 	private isTaskCompleted(task: TaskInfo): boolean {
 		return this.plugin.statusManager.isCompletedStatus(task.status);
 	}
@@ -588,6 +532,65 @@ export class DashboardService {
 		} catch {
 			return null;
 		}
+	}
+
+	private getTasksForDate(tasks: TaskInfo[], date: Date): TaskInfo[] {
+		const dateKey = format(date, "yyyy-MM-dd");
+		const seen = new Set<string>();
+		const result: TaskInfo[] = [];
+
+		for (const task of this.sortTasksByPriorityAndDate(tasks)) {
+			const matchesScheduled = getDatePart(task.scheduled || "") === dateKey;
+			const matchesDue = getDatePart(task.due || "") === dateKey;
+			if ((matchesScheduled || matchesDue) && !seen.has(task.path)) {
+				result.push(task);
+				seen.add(task.path);
+			}
+		}
+
+		return result;
+	}
+
+	private buildWeekGroups(tasks: TaskInfo[], weekStart: Date): DashboardPlannerDayGroup[] {
+		const groups: DashboardPlannerDayGroup[] = [];
+
+		for (let index = 0; index < 7; index += 1) {
+			const day = addDays(weekStart, index);
+			groups.push({
+				date: format(day, "yyyy-MM-dd"),
+				label: format(day, "EEEE, d MMM"),
+				tasks: this.getTasksForDate(tasks, day),
+			});
+		}
+
+		return groups;
+	}
+
+
+	private sortTasksByPriorityAndDate(tasks: TaskInfo[]): TaskInfo[] {
+		return [...tasks].sort((left, right) => {
+			const leftRank = this.getPriorityRank(left.priority);
+			const rightRank = this.getPriorityRank(right.priority);
+			if (leftRank !== rightRank) {
+				return leftRank - rightRank;
+			}
+
+			const leftDate = left.scheduled || left.due || "9999-99-99";
+			const rightDate = right.scheduled || right.due || "9999-99-99";
+			if (leftDate !== rightDate) {
+				return leftDate.localeCompare(rightDate);
+			}
+
+			return left.title.localeCompare(right.title);
+		});
+	}
+
+	private getPriorityRank(priority: string): number {
+		const priorities = [...(this.plugin.settings.customPriorities || [])].sort(
+			(left, right) => left.weight - right.weight
+		);
+		const index = priorities.findIndex((item) => item.value === priority);
+		return index === -1 ? priorities.length + 1 : index;
 	}
 
 	private taskBelongsToProject(task: TaskInfo, project: ProjectInfo): boolean {

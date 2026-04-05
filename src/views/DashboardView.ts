@@ -1,6 +1,8 @@
 import { ItemView, Notice, TFile, WorkspaceLeaf, normalizePath, setIcon } from "obsidian";
 import { addDays, addMonths, endOfMonth, endOfWeek, format, isSameMonth, startOfMonth, startOfWeek } from "date-fns";
 import TaskNotesPlugin from "../main";
+import { createTaskCard } from "../ui/TaskCard";
+import { PropertyVisibilityDropdown } from "../ui/PropertyVisibilityDropdown";
 import {
 	DASHBOARD_VIEW_TYPE,
 	type DashboardCaptureOption,
@@ -14,13 +16,23 @@ import {
 	type DashboardProjectsListItem,
 	type GoalInfo,
 	type GoalPeriodType,
+	type TaskSortKey,
 	type TaskInfo,
 } from "../types";
 import { getTodayString, parseDateAsLocal } from "../utils/dateUtils";
 import { ensureFolderExists } from "../utils/helpers";
+import { convertInternalToUserProperties } from "../utils/propertyMapping";
+import { normalizeEntityLink } from "../core/links/normalizeEntityLink";
 
 type DashboardGoalScopeLocal = "today" | "week" | "month";
 type TaskVisibilityFilter = "open" | "done" | "all";
+type DashboardProjectFilter = "all" | string;
+
+interface DashboardViewPreferences {
+	plannerSortKey?: TaskSortKey;
+	plannerProjectFilter?: DashboardProjectFilter;
+	plannerVisibleProperties?: string[];
+}
 
 export class DashboardView extends ItemView {
 	private dashboardData: DashboardData | null = null;
@@ -33,6 +45,9 @@ export class DashboardView extends ItemView {
 	private projectSort: DashboardProjectSort = "due";
 	private projectStatusFilter = "all";
 	private taskVisibilityFilter: TaskVisibilityFilter = "open";
+	private plannerSortKey: TaskSortKey = "priority";
+	private plannerProjectFilter: DashboardProjectFilter = "all";
+	private plannerVisibleProperties = ["status", "priority", "projects", "scheduled", "due"];
 	private quickActionsOpen = false;
 	private captureValue = "";
 	private captureProject = "";
@@ -56,6 +71,7 @@ export class DashboardView extends ItemView {
 
 	async onOpen(): Promise<void> {
 		await this.plugin.onReady();
+		this.loadViewPreferences();
 		this.registerEvent(this.plugin.emitter.on("data-changed", () => this.scheduleRefresh()));
 		this.registerEvent(this.plugin.emitter.on("task-updated", () => this.scheduleRefresh()));
 		this.registerEvent(this.plugin.emitter.on("date-changed", () => this.scheduleRefresh()));
@@ -421,13 +437,63 @@ export class DashboardView extends ItemView {
 				"dashboard-v2__select dashboard-v2__select--compact"
 			)
 		);
+		controls.appendChild(
+			this.createSelectControl(
+				[
+					{ value: "priority", label: "Sort by priority" },
+					{ value: "scheduled", label: "Sort by plan" },
+					{ value: "due", label: "Sort by deadline" },
+					{ value: "status", label: "Sort by status" },
+					{ value: "title", label: "Sort by title" },
+				],
+				this.plannerSortKey,
+				(value) => {
+					this.plannerSortKey = value as TaskSortKey;
+					this.saveViewPreferences();
+					this.render();
+				},
+				"dashboard-v2__select dashboard-v2__select--compact"
+			)
+		);
+		controls.appendChild(
+			this.createSelectControl(
+				[
+					{ value: "all", label: "All projects" },
+					...this.getPlannerProjectOptions(),
+				],
+				this.plannerProjectFilter,
+				(value) => {
+					this.plannerProjectFilter = value;
+					this.saveViewPreferences();
+					this.render();
+				},
+				"dashboard-v2__select dashboard-v2__select--compact"
+			)
+		);
+		const propertiesButton = controls.createEl("button", {
+			cls: "dashboard-v2__subtle-button",
+			text: "Properties",
+			attr: { "aria-label": "Choose visible task properties" },
+		});
+		this.registerDomEvent(propertiesButton, "click", (event) => {
+			new PropertyVisibilityDropdown(
+				this.plannerVisibleProperties,
+				this.plugin,
+				(properties) => {
+					this.plannerVisibleProperties = properties;
+					this.saveViewPreferences();
+					this.render();
+				}
+			).show(event);
+		});
 
 		if (this.plannerMode === "today") {
-			this.renderTodayPlanner(section, this.applyTaskVisibilityFilter(this.dashboardData.planner.todayTasks));
+			this.renderTodayPlanner(section, this.preparePlannerTasks(this.dashboardData.planner.todayTasks));
 			return;
 		}
 
 		if (this.plannerMode === "week") {
+			this.renderPlannerWeekHeader(section);
 			this.renderWeekPlanner(section, this.dashboardData.planner.weekGroups);
 			return;
 		}
@@ -441,10 +507,7 @@ export class DashboardView extends ItemView {
 			return;
 		}
 
-		const list = container.createDiv({ cls: "dashboard-v2__task-stream" });
-		for (const task of tasks) {
-			this.renderTaskRow(list, task, "today");
-		}
+		this.renderPlannerTaskCards(container, tasks, parseDateAsLocal(this.dashboardData?.currentDate || getTodayString()));
 	}
 
 	private renderWeekPlanner(container: HTMLElement, groups: DashboardPlannerDayGroup[]): void {
@@ -452,7 +515,7 @@ export class DashboardView extends ItemView {
 		const visibleGroups = groups
 			.map((group) => ({
 				...group,
-				tasks: this.applyTaskVisibilityFilter(group.tasks),
+				tasks: this.preparePlannerTasks(group.tasks),
 			}))
 			.filter((group) => group.tasks.length > 0);
 
@@ -468,10 +531,32 @@ export class DashboardView extends ItemView {
 			dayHeader.createDiv({ cls: "dashboard-v2__pill", text: String(group.tasks.length) });
 
 			const dayList = dayBlock.createDiv({ cls: "dashboard-v2__task-stream" });
-			for (const task of group.tasks) {
-				this.renderTaskRow(dayList, task, "week");
-			}
+			this.renderPlannerTaskCards(dayList, group.tasks, parseDateAsLocal(group.date));
 		}
+	}
+
+	private renderPlannerWeekHeader(container: HTMLElement): void {
+		if (!this.dashboardData) return;
+		const groups = this.dashboardData.planner.weekGroups;
+		if (groups.length === 0) return;
+
+		const header = container.createDiv({ cls: "dashboard-v2__planner-range" });
+		const previousButton = this.createIconButton(header, "chevron-left", "Previous week");
+		this.registerDomEvent(previousButton, "click", () => {
+			this.selectedDate = format(addDays(parseDateAsLocal(this.selectedDate), -7), "yyyy-MM-dd");
+			void this.refresh();
+		});
+
+		header.createDiv({
+			cls: "dashboard-v2__planner-range-label",
+			text: this.formatPlannerWeekRange(groups[0].date, groups[groups.length - 1].date),
+		});
+
+		const nextButton = this.createIconButton(header, "chevron-right", "Next week");
+		this.registerDomEvent(nextButton, "click", () => {
+			this.selectedDate = format(addDays(parseDateAsLocal(this.selectedDate), 7), "yyyy-MM-dd");
+			void this.refresh();
+		});
 	}
 
 	private renderCalendarPlanner(container: HTMLElement): void {
@@ -544,9 +629,7 @@ export class DashboardView extends ItemView {
 			});
 		}
 
-		const selectedTasks = this.applyTaskVisibilityFilter(
-			this.dashboardData.planner.weekGroups.flatMap((group) => (group.date === calendar.selectedDate ? group.tasks : []))
-		);
+		const selectedTasks = this.preparePlannerTasks(calendar.selectedTasks);
 
 		const detail = container.createDiv({ cls: "dashboard-v2__calendar-detail" });
 		detail.createDiv({
@@ -557,10 +640,7 @@ export class DashboardView extends ItemView {
 		if (selectedTasks.length === 0) {
 			detail.createEl("p", { cls: "dashboard-v2__empty", text: "No tasks on this day." });
 		} else {
-			const list = detail.createDiv({ cls: "dashboard-v2__task-stream" });
-			for (const task of selectedTasks) {
-				this.renderTaskRow(list, task, "week");
-			}
+			this.renderPlannerTaskCards(detail, selectedTasks, parseDateAsLocal(calendar.selectedDate));
 		}
 	}
 
@@ -591,7 +671,7 @@ export class DashboardView extends ItemView {
 		controls.appendChild(
 			this.createSelectControl(
 				[
-					{ label: "Sort by due", value: "due" },
+					{ label: "Sort by deadline", value: "due" },
 					{ label: "Sort by progress", value: "progress" },
 					{ label: "Sort by title", value: "title" },
 					{ label: "Sort by status", value: "status" },
@@ -643,7 +723,7 @@ export class DashboardView extends ItemView {
 		meta.createDiv({ cls: "dashboard-v2__pill", text: item.project.status });
 		meta.createDiv({ cls: "dashboard-v2__pill", text: `${item.completedTaskCount}/${item.totalTasks || 0}` });
 		if (item.nextDueDate) {
-			meta.createDiv({ cls: "dashboard-v2__pill dashboard-v2__pill--accent", text: `Due ${item.nextDueDate}` });
+			meta.createDiv({ cls: "dashboard-v2__pill dashboard-v2__pill--accent", text: `Deadline ${item.nextDueDate}` });
 		}
 
 		const actions = line.createDiv({ cls: "dashboard-v2__project-actions" });
@@ -693,7 +773,8 @@ export class DashboardView extends ItemView {
 		});
 
 		const controls = section.createDiv({ cls: "dashboard-v2__capture-controls" });
-		controls.appendChild(
+		const selectors = controls.createDiv({ cls: "dashboard-v2__capture-selectors" });
+		selectors.appendChild(
 			this.createSelectControl(
 				[{ label: "No project", value: "" }, ...this.dashboardData.capture.projects],
 				this.captureProject,
@@ -702,7 +783,7 @@ export class DashboardView extends ItemView {
 				}
 			)
 		);
-		controls.appendChild(
+		selectors.appendChild(
 			this.createSelectControl(
 				[{ label: "No goal", value: "" }, ...this.dashboardData.capture.goals],
 				this.captureGoal,
@@ -732,29 +813,17 @@ export class DashboardView extends ItemView {
 		});
 	}
 
-	private renderTaskRow(container: HTMLElement, task: TaskInfo, mode: "today" | "week"): void {
-		const row = container.createDiv({ cls: "dashboard-v2__task-row" });
-		const timeText = this.getTaskTimeLabel(task, mode);
-		row.createDiv({ cls: "dashboard-v2__task-time", text: timeText });
+	private renderPlannerTaskCards(container: HTMLElement, tasks: TaskInfo[], targetDate: Date): void {
+		const list = container.createDiv({ cls: "dashboard-v2__task-stream dashboard-v2__task-stream--cards" });
+		const visibleProperties = this.getPlannerVisibleProperties();
 
-		const body = row.createDiv({ cls: "dashboard-v2__task-body" });
-		const titleButton = body.createEl("button", {
-			cls: "dashboard-v2__task-title",
-			text: task.title,
-			attr: { "aria-label": `Open task ${task.title}` },
-		});
-		this.registerDomEvent(titleButton, "click", () => {
-			void this.openPath(task.path);
-		});
-
-		const meta = body.createDiv({ cls: "dashboard-v2__task-meta" });
-		const projectTitle = this.getTaskProjectTitle(task);
-		if (projectTitle) {
-			meta.createDiv({ cls: "dashboard-v2__pill", text: projectTitle });
-		}
-		meta.createDiv({ cls: "dashboard-v2__pill", text: task.status });
-		if (task.priority) {
-			meta.createDiv({ cls: "dashboard-v2__pill dashboard-v2__pill--priority", text: task.priority });
+		for (const task of tasks) {
+			const card = createTaskCard(task, this.plugin, visibleProperties, {
+				layout: "compact",
+				targetDate,
+			});
+			card.addClass("dashboard-v2__planner-card");
+			list.appendChild(card);
 		}
 	}
 
@@ -804,16 +873,55 @@ export class DashboardView extends ItemView {
 		});
 	}
 
-	private getTaskTimeLabel(task: TaskInfo, mode: "today" | "week"): string {
-		const source = task.scheduled || task.due || "";
-		if (source.includes("T")) {
-			return source.split("T")[1].slice(0, 5);
+	private preparePlannerTasks(tasks: TaskInfo[]): TaskInfo[] {
+		return this.sortPlannerTasks(this.applyProjectFilter(this.applyTaskVisibilityFilter(tasks)));
+	}
+
+	private applyProjectFilter(tasks: TaskInfo[]): TaskInfo[] {
+		if (this.plannerProjectFilter === "all") {
+			return tasks;
 		}
-		if (mode === "week" && source) {
-			return getTodayString() === getTodayString() ? format(parseDateAsLocal(source.slice(0, 10)), "d MMM") : source;
-		}
-		if (task.due && !task.scheduled) return "Due";
-		return "Any time";
+
+		return tasks.filter((task) =>
+			(task.projects || []).some((projectLink) => this.resolveLinkedEntityPath(projectLink) === this.plannerProjectFilter)
+		);
+	}
+
+	private sortPlannerTasks(tasks: TaskInfo[]): TaskInfo[] {
+		return [...tasks].sort((left, right) => {
+			let comparison = 0;
+
+			switch (this.plannerSortKey) {
+				case "due":
+					comparison = this.compareOptionalDates(left.due, right.due);
+					break;
+				case "scheduled":
+					comparison = this.compareOptionalDates(left.scheduled, right.scheduled);
+					break;
+				case "status":
+					comparison = this.compareStatuses(left.status, right.status);
+					break;
+				case "title":
+					comparison = left.title.localeCompare(right.title);
+					break;
+				case "priority":
+				default:
+					comparison = this.comparePriorities(left.priority, right.priority);
+					break;
+			}
+
+			if (comparison !== 0) {
+				return comparison;
+			}
+
+			const leftDate = left.scheduled || left.due || "9999-99-99";
+			const rightDate = right.scheduled || right.due || "9999-99-99";
+			if (leftDate !== rightDate) {
+				return leftDate.localeCompare(rightDate);
+			}
+
+			return left.title.localeCompare(right.title);
+		});
 	}
 
 	private getTaskProjectTitle(task: TaskInfo): string | null {
@@ -824,6 +932,20 @@ export class DashboardView extends ItemView {
 		if (resolved) return resolved.title;
 		const fallback = normalized.split("/").pop() || normalized;
 		return fallback.replace(/\.md$/i, "");
+	}
+
+	private getPlannerVisibleProperties(): string[] {
+		return convertInternalToUserProperties(this.plannerVisibleProperties, this.plugin);
+	}
+
+	private getPlannerProjectOptions(): DashboardCaptureOption[] {
+		if (!this.dashboardData) return [];
+		return this.dashboardData.projectsBoard.projects
+			.map((item) => ({
+				label: item.project.title,
+				value: item.project.path,
+			}))
+			.sort((left, right) => left.label.localeCompare(right.label));
 	}
 
 	private createSegmentedControl(
@@ -918,6 +1040,7 @@ export class DashboardView extends ItemView {
 			relatedNotes,
 			creationContext: "manual-creation",
 		});
+		await this.plugin.goalService.syncTaskGoal(result.file.path, this.captureGoal || undefined);
 		this.captureValue = "";
 		this.captureProject = "";
 		this.captureGoal = "";
@@ -981,9 +1104,7 @@ export class DashboardView extends ItemView {
 
 	private getFocusTaskOptions(): DashboardCaptureOption[] {
 		const options = new Map<string, DashboardCaptureOption>();
-		const plannerTasks = this.dashboardData
-			? [...this.dashboardData.planner.todayTasks, ...this.dashboardData.planner.weekGroups.flatMap((group) => group.tasks)]
-			: [];
+		const plannerTasks = this.dashboardData ? this.getAllPlannerTasksForFocus() : [];
 
 		for (const task of plannerTasks) {
 			if (!options.has(task.path)) {
@@ -999,7 +1120,7 @@ export class DashboardView extends ItemView {
 		const selectedPath = this.plugin.pomodoroService.getState().currentSession?.taskPath || this.focusTaskPath;
 		if (!selectedPath) return null;
 
-		const tasks = [...this.dashboardData.planner.todayTasks, ...this.dashboardData.planner.weekGroups.flatMap((group) => group.tasks)];
+		const tasks = this.getAllPlannerTasksForFocus();
 		return tasks.find((task) => task.path === selectedPath) ?? null;
 	}
 
@@ -1037,6 +1158,102 @@ export class DashboardView extends ItemView {
 		const minutes = Math.floor(safeTime / 60);
 		const seconds = safeTime % 60;
 		return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+	}
+
+	private formatPlannerWeekRange(startDate: string, endDate: string): string {
+		const start = parseDateAsLocal(startDate);
+		const end = parseDateAsLocal(endDate);
+		const sameMonth = format(start, "yyyy-MM") === format(end, "yyyy-MM");
+		const sameYear = format(start, "yyyy") === format(end, "yyyy");
+
+		if (sameMonth) {
+			return `Week ${format(start, "d")} - ${format(end, "d MMM yyyy")}`;
+		}
+
+		if (sameYear) {
+			return `Week ${format(start, "d MMM")} - ${format(end, "d MMM yyyy")}`;
+		}
+
+		return `Week ${format(start, "d MMM yyyy")} - ${format(end, "d MMM yyyy")}`;
+	}
+
+	private getAllPlannerTasksForFocus(): TaskInfo[] {
+		if (!this.dashboardData) return [];
+
+		const seen = new Map<string, TaskInfo>();
+		for (const task of [
+			...this.dashboardData.planner.todayTasks,
+			...this.dashboardData.planner.weekGroups.flatMap((group) => group.tasks),
+			...this.dashboardData.planner.calendar.selectedTasks,
+		]) {
+			if (!seen.has(task.path)) {
+				seen.set(task.path, task);
+			}
+		}
+
+		return this.preparePlannerTasks([...seen.values()]);
+	}
+
+	private loadViewPreferences(): void {
+		const prefs = this.plugin.viewStateManager.getViewPreferences<DashboardViewPreferences>(DASHBOARD_VIEW_TYPE);
+		if (!prefs) {
+			return;
+		}
+
+		this.plannerSortKey = prefs.plannerSortKey || this.plannerSortKey;
+		this.plannerProjectFilter = prefs.plannerProjectFilter || this.plannerProjectFilter;
+		if (prefs.plannerVisibleProperties?.length) {
+			this.plannerVisibleProperties = [...prefs.plannerVisibleProperties];
+		}
+	}
+
+	private saveViewPreferences(): void {
+		this.plugin.viewStateManager.setViewPreferences<DashboardViewPreferences>(DASHBOARD_VIEW_TYPE, {
+			plannerSortKey: this.plannerSortKey,
+			plannerProjectFilter: this.plannerProjectFilter,
+			plannerVisibleProperties: [...this.plannerVisibleProperties],
+		});
+	}
+
+	private comparePriorities(left: string, right: string): number {
+		const priorities = [...(this.plugin.settings.customPriorities || [])].sort(
+			(a, b) => a.weight - b.weight
+		);
+		const leftIndex = priorities.findIndex((item) => item.value === left);
+		const rightIndex = priorities.findIndex((item) => item.value === right);
+		const leftRank = leftIndex === -1 ? priorities.length + 1 : leftIndex;
+		const rightRank = rightIndex === -1 ? priorities.length + 1 : rightIndex;
+		return leftRank - rightRank;
+	}
+
+	private compareStatuses(left: string, right: string): number {
+		const statuses = this.plugin.settings.customStatuses || [];
+		const leftIndex = statuses.findIndex((item) => item.value === left);
+		const rightIndex = statuses.findIndex((item) => item.value === right);
+		const leftRank = leftIndex === -1 ? statuses.length + 1 : leftIndex;
+		const rightRank = rightIndex === -1 ? statuses.length + 1 : rightIndex;
+		return leftRank - rightRank;
+	}
+
+	private compareOptionalDates(left?: string, right?: string): number {
+		if (!left && !right) return 0;
+		if (!left) return 1;
+		if (!right) return -1;
+		return left.localeCompare(right);
+	}
+
+	private resolveLinkedEntityPath(link: string): string {
+		const normalized = normalizeEntityLink(link);
+		if (!normalized) {
+			return "";
+		}
+
+		const linkPath = normalized.replace(/\.md$/i, "");
+		const metadataCache = this.plugin.app.metadataCache as {
+			getFirstLinkpathDest?: (linkpath: string, sourcePath: string) => { path: string } | null;
+		};
+		const resolved = metadataCache.getFirstLinkpathDest?.(linkPath, "");
+		return normalizePath(resolved?.path ?? normalized);
 	}
 
 	private slugify(value: string): string {

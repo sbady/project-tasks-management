@@ -242,7 +242,7 @@ export const FILTER_PROPERTIES: PropertyDefinition[] = [
 	// Date properties
 	{
 		id: "due",
-		label: "Due Date",
+		label: "Deadline",
 		category: "date",
 		supportedOperators: [
 			"is",
@@ -258,7 +258,7 @@ export const FILTER_PROPERTIES: PropertyDefinition[] = [
 	},
 	{
 		id: "scheduled",
-		label: "Scheduled Date",
+		label: "Plan",
 		category: "date",
 		supportedOperators: [
 			"is",
@@ -590,6 +590,7 @@ export interface DashboardDeadlinesPayload {
 export interface DashboardMiniCalendarPayload {
 	selectedDate: string;
 	markers: Record<string, number>;
+	selectedTasks: TaskInfo[];
 }
 
 export interface DashboardQuickAction {

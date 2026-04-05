@@ -27,8 +27,8 @@ export function getAvailableProperties(
 		{ id: "priority", label: makeLabel("Priority", "priority") },
 		{ id: "blocked", label: "Blocked Status" }, // Special property, not in FieldMapping
 		{ id: "blocking", label: "Blocking Status" }, // Special property, not in FieldMapping
-		{ id: "due", label: makeLabel("Due Date", "due") },
-		{ id: "scheduled", label: makeLabel("Scheduled Date", "scheduled") },
+		{ id: "due", label: makeLabel("Deadline", "due") },
+		{ id: "scheduled", label: makeLabel("Plan", "scheduled") },
 		{ id: "timeEstimate", label: makeLabel("Time Estimate", "timeEstimate") },
 		{ id: "totalTrackedTime", label: "Total Tracked Time" }, // Computed property, not in FieldMapping
 		{ id: "checklistProgress", label: "Checklist Progress" }, // Computed from metadata cache listItems
