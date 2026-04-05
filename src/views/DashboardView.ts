@@ -279,8 +279,8 @@ export class DashboardView extends ItemView {
 		top.appendChild(
 			this.createSelectControl(
 				[
-					{ value: "today", label: "Today" },
-					{ value: "week", label: "Week" },
+					{ value: "today", label: "Сегодня" },
+					{ value: "week", label: "Неделя" },
 				],
 				this.progressScope,
 				(value) => {
@@ -303,9 +303,9 @@ export class DashboardView extends ItemView {
 		const progress = total > 0 ? completed / total : 0;
 
 		const stats = card.createDiv({ cls: "dashboard-v2__progress-stats" });
-		this.renderMetric(stats, "Completed", String(completed));
-		this.renderMetric(stats, "Remaining", String(remaining));
-		this.renderMetric(stats, "Total", String(total));
+		this.renderMetric(stats, "Готово", String(completed));
+		this.renderMetric(stats, "Осталось", String(remaining));
+		this.renderMetric(stats, "Всего", String(total));
 
 		const bar = card.createDiv({ cls: "dashboard-v2__progress-bar" });
 		const fill = bar.createDiv({ cls: "dashboard-v2__progress-fill" });
@@ -320,9 +320,9 @@ export class DashboardView extends ItemView {
 		top.appendChild(
 			this.createSelectControl(
 				[
-					{ value: "today", label: "Today goals" },
-					{ value: "week", label: "Week goals" },
-					{ value: "month", label: "Month goals" },
+					{ value: "today", label: "Цели на сегодня" },
+					{ value: "week", label: "Цели недели" },
+					{ value: "month", label: "Цели месяца" },
 				],
 				this.goalScope,
 				(value) => {
@@ -337,7 +337,7 @@ export class DashboardView extends ItemView {
 		if (goals.length === 0) {
 			card.createEl("p", {
 				cls: "dashboard-v2__empty",
-				text: "No goals in this scope yet.",
+				text: "В этом периоде пока нет целей.",
 			});
 		} else {
 			const list = card.createDiv({ cls: "dashboard-v2__goal-list" });
@@ -349,7 +349,7 @@ export class DashboardView extends ItemView {
 		const actions = card.createDiv({ cls: "dashboard-v2__panel-actions" });
 		const createButton = actions.createEl("button", {
 			cls: "dashboard-v2__subtle-button",
-			text: "New goal",
+			text: "Новая цель",
 			attr: { "aria-label": "Create goal" },
 		});
 		this.registerDomEvent(createButton, "click", () => {
@@ -385,13 +385,13 @@ export class DashboardView extends ItemView {
 		if (item.activeTasksToday > 0) {
 			meta.createDiv({
 				cls: "dashboard-v2__pill dashboard-v2__pill--accent",
-				text: `${item.activeTasksToday} today`,
+				text: `${item.activeTasksToday} сегодня`,
 			});
 		}
 		if (item.activeTasksThisWeek > 0) {
 			meta.createDiv({
 				cls: "dashboard-v2__pill",
-				text: `${item.activeTasksThisWeek} this week`,
+				text: `${item.activeTasksThisWeek} на неделе`,
 			});
 		}
 
