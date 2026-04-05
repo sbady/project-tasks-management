@@ -1173,7 +1173,7 @@ export class DashboardView extends ItemView {
 				? `${format(start, "d")} - ${format(end, "d MMM")}`
 				: `${format(start, "d MMM")} - ${format(end, "d MMM")}`;
 
-		return `Week #${weekNumber} · ${rangeLabel} · ${monthYear}`;
+		return `Week #${weekNumber} - ${rangeLabel} - ${monthYear}`;
 	}
 
 	private getAllPlannerTasksForFocus(): TaskInfo[] {
