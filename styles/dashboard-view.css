@@ -171,9 +171,16 @@
 
 .dashboard-v2__top-grid {
 	display: grid;
-	grid-template-columns: minmax(250px, 1fr) minmax(210px, 0.72fr) minmax(280px, 1fr);
+	grid-template-columns: minmax(320px, 0.95fr) minmax(420px, 1.25fr);
 	gap: 14px;
 	align-items: start;
+}
+
+.dashboard-v2__top-stack {
+	display: flex;
+	flex-direction: column;
+	gap: 14px;
+	min-width: 0;
 }
 
 .dashboard-v2__panel-top,
@@ -281,6 +288,7 @@
 
 .dashboard-v2__goal-item {
 	overflow: hidden;
+	cursor: pointer;
 }
 
 .dashboard-v2__goal-title,
@@ -312,6 +320,24 @@
 	flex-wrap: wrap;
 }
 
+.dashboard-v2__goal-pill-button {
+	border: none;
+	cursor: pointer;
+	font: inherit;
+}
+
+.dashboard-v2__goal-pill-button:hover {
+	filter: brightness(1.06);
+	transform: translateY(-1px);
+}
+
+.dashboard-v2__planner-goal-indicator {
+	max-width: 260px;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
 .dashboard-v2__goal-ratio,
 .dashboard-v2__pill,
 .dashboard-v2__calendar-marker {
@@ -325,6 +351,12 @@
 	color: var(--text-muted);
 	background: color-mix(in srgb, var(--background-modifier-hover) 76%, var(--background-secondary));
 	white-space: nowrap;
+}
+
+.dashboard-v2__goal-item:focus-visible,
+.dashboard-v2__goal-pill-button:focus-visible {
+	outline: 2px solid var(--interactive-accent);
+	outline-offset: 2px;
 }
 
 .dashboard-v2__pill--accent,

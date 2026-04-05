@@ -32,6 +32,7 @@ interface DashboardViewPreferences {
 	plannerSortKey?: TaskSortKey;
 	plannerProjectFilter?: DashboardProjectFilter;
 	plannerVisibleProperties?: string[];
+	plannerGoalFilterPath?: string;
 }
 
 export class DashboardView extends ItemView {
@@ -47,6 +48,7 @@ export class DashboardView extends ItemView {
 	private taskVisibilityFilter: TaskVisibilityFilter = "open";
 	private plannerSortKey: TaskSortKey = "priority";
 	private plannerProjectFilter: DashboardProjectFilter = "all";
+	private plannerGoalFilterPath = "";
 	private plannerVisibleProperties = ["status", "priority", "projects", "scheduled", "due"];
 	private quickActionsOpen = false;
 	private captureValue = "";
@@ -179,8 +181,9 @@ export class DashboardView extends ItemView {
 		if (!this.dashboardData) return;
 
 		const topRow = container.createDiv({ cls: "dashboard-v2__top-grid" });
-		this.renderFocusCard(topRow);
-		this.renderProgressCard(topRow);
+		const leftColumn = topRow.createDiv({ cls: "dashboard-v2__top-stack" });
+		this.renderProgressCard(leftColumn);
+		this.renderFocusCard(leftColumn);
 		this.renderGoalsCard(topRow);
 	}
 
@@ -363,14 +366,23 @@ export class DashboardView extends ItemView {
 
 	private renderGoalItem(container: HTMLElement, item: DashboardGoalProgressItem): void {
 		const row = container.createDiv({ cls: "dashboard-v2__goal-item" });
+		row.tabIndex = 0;
+		row.setAttribute("role", "button");
+		row.setAttribute("aria-label", `Open goal ${item.goal.title}`);
+		this.registerDomEvent(row, "click", () => {
+			void this.openPath(item.goal.path);
+		});
+		this.registerDomEvent(row, "keydown", (event) => {
+			if (event.key === "Enter" || event.key === " ") {
+				event.preventDefault();
+				void this.openPath(item.goal.path);
+			}
+		});
+
 		const header = row.createDiv({ cls: "dashboard-v2__goal-head" });
-		const titleButton = header.createEl("button", {
+		header.createDiv({
 			cls: "dashboard-v2__goal-title",
 			text: item.goal.title,
-			attr: { "aria-label": `Open goal ${item.goal.title}` },
-		});
-		this.registerDomEvent(titleButton, "click", () => {
-			void this.openPath(item.goal.path);
 		});
 		header.createDiv({
 			cls: "dashboard-v2__goal-ratio",
@@ -383,15 +395,23 @@ export class DashboardView extends ItemView {
 			text: `${Math.round(item.progress * 100)}%`,
 		});
 		if (item.activeTasksToday > 0) {
-			meta.createDiv({
-				cls: "dashboard-v2__pill dashboard-v2__pill--accent",
+			const todayButton = meta.createEl("button", {
+				cls: "dashboard-v2__pill dashboard-v2__pill--accent dashboard-v2__goal-pill-button",
 				text: `${item.activeTasksToday} сегодня`,
+			});
+			this.registerDomEvent(todayButton, "click", (event) => {
+				event.stopPropagation();
+				this.applyGoalPlannerFilter(item.goal.path, "today");
 			});
 		}
 		if (item.activeTasksThisWeek > 0) {
-			meta.createDiv({
-				cls: "dashboard-v2__pill",
+			const weekButton = meta.createEl("button", {
+				cls: "dashboard-v2__pill dashboard-v2__goal-pill-button",
 				text: `${item.activeTasksThisWeek} на неделе`,
+			});
+			this.registerDomEvent(weekButton, "click", (event) => {
+				event.stopPropagation();
+				this.applyGoalPlannerFilter(item.goal.path, "week");
 			});
 		}
 
@@ -470,6 +490,19 @@ export class DashboardView extends ItemView {
 				"dashboard-v2__select dashboard-v2__select--compact"
 			)
 		);
+		if (this.plannerGoalFilterPath) {
+			const goalFilter = this.getPlannerGoalFilter();
+			const goalIndicator = controls.createEl("button", {
+				cls: "dashboard-v2__subtle-button dashboard-v2__planner-goal-indicator",
+				text: goalFilter ? `Цель: ${goalFilter.title}` : "Фильтр по цели",
+				attr: { "aria-label": "Clear goal filter" },
+			});
+			this.registerDomEvent(goalIndicator, "click", () => {
+				this.plannerGoalFilterPath = "";
+				this.saveViewPreferences();
+				this.render();
+			});
+		}
 		const propertiesButton = controls.createEl("button", {
 			cls: "dashboard-v2__subtle-button",
 			text: "Properties",
@@ -875,7 +908,9 @@ export class DashboardView extends ItemView {
 	}
 
 	private preparePlannerTasks(tasks: TaskInfo[]): TaskInfo[] {
-		return this.sortPlannerTasks(this.applyProjectFilter(this.applyTaskVisibilityFilter(tasks)));
+		return this.sortPlannerTasks(
+			this.applyGoalFilter(this.applyProjectFilter(this.applyTaskVisibilityFilter(tasks)))
+		);
 	}
 
 	private applyProjectFilter(tasks: TaskInfo[]): TaskInfo[] {
@@ -886,6 +921,25 @@ export class DashboardView extends ItemView {
 		return tasks.filter((task) =>
 			(task.projects || []).some((projectLink) => this.resolveLinkedEntityPath(projectLink) === this.plannerProjectFilter)
 		);
+	}
+
+	private applyGoalFilter(tasks: TaskInfo[]): TaskInfo[] {
+		if (!this.plannerGoalFilterPath) {
+			return tasks;
+		}
+
+		const goal = this.plugin.goalRepository.getGoal(this.plannerGoalFilterPath);
+		if (!goal) {
+			return tasks;
+		}
+
+		const relatedTaskPaths = new Set(
+			(goal.relatedTasks || [])
+				.map((link) => this.resolveLinkedEntityPath(link))
+				.filter((value): value is string => value.length > 0)
+		);
+
+		return tasks.filter((task) => relatedTaskPaths.has(normalizePath(task.path)));
 	}
 
 	private sortPlannerTasks(tasks: TaskInfo[]): TaskInfo[] {
@@ -947,6 +1001,21 @@ export class DashboardView extends ItemView {
 				value: item.project.path,
 			}))
 			.sort((left, right) => left.label.localeCompare(right.label));
+	}
+
+	private getPlannerGoalFilter(): GoalInfo | null {
+		if (!this.plannerGoalFilterPath) {
+			return null;
+		}
+
+		return this.plugin.goalRepository.getGoal(this.plannerGoalFilterPath);
+	}
+
+	private applyGoalPlannerFilter(goalPath: string, scope: "today" | "week"): void {
+		this.plannerGoalFilterPath = goalPath;
+		this.plannerMode = scope;
+		this.saveViewPreferences();
+		this.render();
 	}
 
 	private createSegmentedControl(
@@ -1201,6 +1270,7 @@ export class DashboardView extends ItemView {
 
 		this.plannerSortKey = prefs.plannerSortKey || this.plannerSortKey;
 		this.plannerProjectFilter = prefs.plannerProjectFilter || this.plannerProjectFilter;
+		this.plannerGoalFilterPath = prefs.plannerGoalFilterPath || this.plannerGoalFilterPath;
 		if (prefs.plannerVisibleProperties?.length) {
 			this.plannerVisibleProperties = [...prefs.plannerVisibleProperties];
 		}
@@ -1210,6 +1280,7 @@ export class DashboardView extends ItemView {
 		this.plugin.viewStateManager.setViewPreferences<DashboardViewPreferences>(DASHBOARD_VIEW_TYPE, {
 			plannerSortKey: this.plannerSortKey,
 			plannerProjectFilter: this.plannerProjectFilter,
+			plannerGoalFilterPath: this.plannerGoalFilterPath,
 			plannerVisibleProperties: [...this.plannerVisibleProperties],
 		});
 	}
