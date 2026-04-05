@@ -53,6 +53,13 @@
 	gap: 10px;
 }
 
+.dashboard-v2__goal-list-controls {
+	display: flex;
+	justify-content: flex-end;
+	gap: 8px;
+	margin-bottom: 4px;
+}
+
 .dashboard-v2__task-stream--cards {
 	gap: 8px;
 }

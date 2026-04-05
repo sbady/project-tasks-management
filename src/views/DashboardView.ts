@@ -54,6 +54,8 @@ export class DashboardView extends ItemView {
 	private captureValue = "";
 	private captureProject = "";
 	private captureGoal = "";
+	private goalsExpanded = false;
+	private goalListOffset = 0;
 
 	constructor(leaf: WorkspaceLeaf, private plugin: TaskNotesPlugin) {
 		super(leaf);
@@ -343,8 +345,35 @@ export class DashboardView extends ItemView {
 				text: "В этом периоде пока нет целей.",
 			});
 		} else {
+			const controls = card.createDiv({ cls: "dashboard-v2__goal-list-controls" });
+			if (goals.length > 3) {
+				const cycleButton = controls.createEl("button", {
+					cls: "dashboard-v2__subtle-button",
+					text: "Другие",
+					attr: { "aria-label": "Show other goals" },
+				});
+				this.registerDomEvent(cycleButton, "click", () => {
+					const nextOffset = this.goalListOffset + 3;
+					this.goalListOffset = nextOffset >= goals.length ? 0 : nextOffset;
+					this.render();
+				});
+			}
+
+			const expandButton = controls.createEl("button", {
+				cls: "dashboard-v2__subtle-button",
+				text: this.goalsExpanded ? "Свернуть" : "Все цели",
+				attr: { "aria-label": this.goalsExpanded ? "Collapse goals" : "Expand goals" },
+			});
+			this.registerDomEvent(expandButton, "click", () => {
+				this.goalsExpanded = !this.goalsExpanded;
+				if (!this.goalsExpanded) {
+					this.goalListOffset = 0;
+				}
+				this.render();
+			});
+
 			const list = card.createDiv({ cls: "dashboard-v2__goal-list" });
-			for (const item of goals) {
+			for (const item of this.getVisibleGoalItems(goals)) {
 				this.renderGoalItem(list, item);
 			}
 		}
@@ -893,9 +922,27 @@ export class DashboardView extends ItemView {
 		groups: DashboardGoalGroupsPayload,
 		scope: DashboardGoalScopeLocal
 	): DashboardGoalProgressItem[] {
-		if (scope === "today") return groups.today;
-		if (scope === "week") return groups.week;
-		return groups.month;
+		const items = scope === "today" ? groups.today : scope === "week" ? groups.week : groups.month;
+		return [...items].sort((left, right) => {
+			if (right.activeTasksToday !== left.activeTasksToday) {
+				return right.activeTasksToday - left.activeTasksToday;
+			}
+			if (right.activeTasksThisWeek !== left.activeTasksThisWeek) {
+				return right.activeTasksThisWeek - left.activeTasksThisWeek;
+			}
+			if (right.progress !== left.progress) {
+				return right.progress - left.progress;
+			}
+			return left.goal.title.localeCompare(right.goal.title);
+		});
+	}
+
+	private getVisibleGoalItems(goals: DashboardGoalProgressItem[]): DashboardGoalProgressItem[] {
+		if (this.goalsExpanded || goals.length <= 3) {
+			return goals;
+		}
+
+		return goals.slice(this.goalListOffset, this.goalListOffset + 3);
 	}
 
 	private applyTaskVisibilityFilter(tasks: TaskInfo[]): TaskInfo[] {
