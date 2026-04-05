@@ -1,0 +1,10 @@
+{
+	"id": "project-task-management",
+	"name": "Project task management",
+	"version": "0.1.0",
+	"minAppVersion": "1.10.1",
+	"description": "Manage projects, tasks, goals, calendar plans, and focus sessions in Markdown.",
+	"author": "Kirill",
+	"authorUrl": "https://github.com/sbady",
+	"isDesktopOnly": false
+}

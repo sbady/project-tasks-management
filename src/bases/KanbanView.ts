@@ -1,0 +1,3421 @@
+/* eslint-disable @typescript-eslint/no-non-null-assertion */
+import { Notice, Platform, setIcon, TFile } from "obsidian";
+import TaskNotesPlugin from "../main";
+import { BasesViewBase } from "./BasesViewBase";
+import { TaskInfo } from "../types";
+import { identifyTaskNotesFromBasesData, BasesDataItem } from "./helpers";
+import { createTaskCard, type TaskCardOptions } from "../ui/TaskCard";
+import { renderGroupTitle } from "./groupTitleRenderer";
+import { type LinkServices } from "../ui/renderers/linkRenderer";
+import { showConfirmationModal } from "../modals/ConfirmationModal";
+import { VirtualScroller } from "../utils/VirtualScroller";
+import {
+	getDatePart,
+	getCurrentTimestamp,
+	parseDateToUTC,
+	createUTCDateFromLocalCalendarDate,
+} from "../utils/dateUtils";
+import {
+	stripPropertyPrefix,
+	isSortOrderInSortConfig,
+	prepareSortOrderUpdate,
+	applySortOrderPlan,
+	DropOperationQueue,
+} from "./sortOrderUtils";
+
+export class KanbanView extends BasesViewBase {
+	type = "tasknotesKanban";
+
+	private boardEl: HTMLElement | null = null;
+	private basesController: any; // Store controller for accessing query.views
+	private currentTaskElements = new Map<string, HTMLElement>();
+	private draggedTaskPath: string | null = null;
+	private draggedTaskPaths: string[] = []; // For batch drag operations
+	private draggedFromColumn: string | null = null; // Track source column for list property handling
+	private draggedFromSwimlane: string | null = null; // Track source swimlane for list property handling
+	private dropTargetPath: string | null = null; // Card-level drop position tracking
+	private pendingRender: boolean = false; // Deferred render while dragging
+	private dropAbove: boolean = true; // Whether drop is above or below target card
+	private dragOverRafId: number = 0; // rAF handle for throttled dragover
+	private dragContainer: HTMLElement | null = null; // Container holding siblings during drag
+	private currentInsertionIndex: number = -1; // Current gap/slot position
+	private dragSourceColumnEl: HTMLElement | null = null; // Source column element (height-locked during drag)
+	private dragTargetColumnEl: HTMLElement | null = null; // Target column element (max-height expanded during drag)
+	private draggedSourceColumns: Map<string, string> = new Map(); // Track source column per task for batch operations
+	private draggedSourceSwimlanes: Map<string, string> = new Map(); // Track source swimlane per task for batch operations
+	private taskInfoCache = new Map<string, TaskInfo>();
+	private sortScopeTaskPaths = new Map<string, string[]>();
+	private sortScopeCandidateTaskPaths = new Map<string, string[]>();
+	private containerListenersRegistered = false;
+	private columnScrollers = new Map<string, VirtualScroller<TaskInfo>>(); // columnKey -> scroller
+	private expandedRelationshipFilterMode: TaskCardOptions["expandedRelationshipFilterMode"] =
+		"inherit";
+	private currentVisibleTaskPaths = new Set<string>();
+	private suppressRenderUntil: number = 0;
+	private postDropTimer: number | null = null;
+	private dropQueue = new DropOperationQueue();
+	private activeDropCount = 0;
+
+	// Touch drag state for mobile
+	private touchDragActive = false;
+	private touchDragGhost: HTMLElement | null = null;
+	private touchStartX = 0;
+	private touchStartY = 0;
+	private longPressTimer: ReturnType<typeof setTimeout> | null = null;
+	private autoScrollTimer: ReturnType<typeof setInterval> | null = null;
+	private autoScrollDirection = 0;
+	private readonly LONG_PRESS_DELAY = 350;
+	private readonly TOUCH_MOVE_THRESHOLD = 10;
+	private readonly AUTO_SCROLL_EDGE = 60;
+	private readonly AUTO_SCROLL_SPEED = 8;
+	private touchDragType: "task" | "column" | null = null;
+	private draggedColumnKey: string | null = null;
+	private boundContextMenuBlocker = (e: Event) => { e.preventDefault(); e.stopPropagation(); };
+	private readonly LARGE_REORDER_WARNING_THRESHOLD = 10;
+
+	// View options (accessed via BasesViewConfig)
+	private swimLanePropertyId: string | null = null;
+	private columnWidth = 280;
+	private maxSwimlaneHeight = 600;
+	private hideEmptyColumns = false;
+	private explodeListColumns = true; // Show items with list properties in multiple columns
+	private consolidateStatusIcon = false; // Show status icon in header only when grouped by status
+	private columnOrders: Record<string, string[]> = {};
+	private configLoaded = false; // Track if we've successfully loaded config
+	/**
+	 * Threshold for enabling virtual scrolling in kanban columns/swimlane cells.
+	 * Virtual scrolling activates when a column or cell has >= 15 cards.
+	 * Lower than TaskListView (100) because kanban cards are typically larger with more
+	 * visible properties, and columns are narrower (more constrained viewport).
+	 * Benefits: ~85% memory reduction, smooth 60fps scrolling for columns with 200+ cards.
+	 */
+	private readonly VIRTUAL_SCROLL_THRESHOLD = 15;
+
+	constructor(controller: any, containerEl: HTMLElement, plugin: TaskNotesPlugin) {
+		super(controller, containerEl, plugin);
+		this.basesController = controller; // Store for groupBy detection
+		// BasesView now provides this.data, this.config, and this.app directly
+		(this.dataAdapter as any).basesView = this;
+		// Note: Don't read config here - this.config is not set until after construction
+		// readViewOptions() will be called in onload()
+	}
+
+	/**
+	 * Component lifecycle: Called when view is first loaded.
+	 * Override from Component base class.
+	 */
+	onload(): void {
+		// Read view options now that config is available
+		this.readViewOptions();
+		// Call parent onload which sets up container and listeners
+		super.onload();
+	}
+
+	/**
+	 * BasesView lifecycle: Called when Bases data changes.
+	 * Override to preserve scroll position during re-renders.
+	 */
+	onDataUpdated(): void {
+		// During drag: defer render (destroying DOM kills drop events)
+		if (this.draggedTaskPath) {
+			this.debugLog("ON-DATA-UPDATED: deferred (drag active)", { draggedTask: this.draggedTaskPath.split("/").pop() });
+			this.pendingRender = true;
+			return;
+		}
+
+		// Post-drop suppression: skip renders until metadataCache has settled.
+		// postDropTimer will fire the guaranteed render.
+		if (this.activeDropCount > 0 || Date.now() < this.suppressRenderUntil) {
+			this.debugLog("ON-DATA-UPDATED: suppressed", { activeDropCount: this.activeDropCount, msRemaining: this.suppressRenderUntil - Date.now() });
+			return;
+		}
+
+		// If we're past the suppression window and Bases fires naturally,
+		// cancel postDropTimer — Bases has fresh data, render now.
+		if (this.postDropTimer) {
+			this.debugLog("ON-DATA-UPDATED: cancelling postDropTimer, rendering with fresh Bases data");
+			clearTimeout(this.postDropTimer);
+			this.postDropTimer = null;
+		} else {
+			this.debugLog("ON-DATA-UPDATED: normal render (no suppression active)");
+		}
+
+		const savedState = this.getEphemeralState();
+		try {
+			this.render();
+		} catch (error) {
+			console.error(`[TaskNotes][${this.type}] Render error:`, error);
+			this.renderError(error as Error);
+		}
+		this.setEphemeralState(savedState);
+	}
+
+	/**
+	 * Read view configuration options from BasesViewConfig.
+	 */
+	private readViewOptions(): void {
+		// Guard: config may not be set yet if called too early
+		if (!this.config || typeof this.config.get !== "function") {
+			return;
+		}
+
+		try {
+			this.swimLanePropertyId = this.config.getAsPropertyId("swimLane");
+			this.columnWidth = (this.config.get("columnWidth") as number) || 280;
+			this.maxSwimlaneHeight = (this.config.get("maxSwimlaneHeight") as number) || 600;
+			this.hideEmptyColumns = (this.config.get("hideEmptyColumns") as boolean) || false;
+
+			// Read explodeListColumns option (defaults to true)
+			const explodeValue = this.config.get("explodeListColumns");
+			this.explodeListColumns = explodeValue !== false; // Default to true if not set
+
+			// Read consolidateStatusIcon option (defaults to false)
+			const consolidateValue = this.config.get('consolidateStatusIcon');
+			this.consolidateStatusIcon = consolidateValue === true; // Default to false if not set
+
+			// Read column orders
+			const columnOrderStr = (this.config.get("columnOrder") as string) || "{}";
+			this.columnOrders = JSON.parse(columnOrderStr);
+
+			// Read enableSearch toggle (default: false for backward compatibility)
+			const enableSearchValue = this.config.get("enableSearch");
+			this.enableSearch = (enableSearchValue as boolean) ?? false;
+			const expandedRelationshipFilterModeValue = this.config.get(
+				"expandedRelationshipFilterMode"
+			);
+			this.expandedRelationshipFilterMode =
+				expandedRelationshipFilterModeValue === "show-all" ? "show-all" : "inherit";
+
+			// Mark config as successfully loaded
+			this.configLoaded = true;
+		} catch (e) {
+			// Use defaults
+			console.warn("[KanbanView] Failed to parse config:", e);
+		}
+	}
+
+	/**
+	 * Save ephemeral state including scroll positions for all columns.
+	 * This preserves scroll position when the view is re-rendered (e.g., after task updates).
+	 */
+	getEphemeralState(): any {
+		const columnScroll: Record<string, number> = {};
+
+		// Save scroll position for virtual scrolling columns (from VirtualScroller)
+		for (const [columnKey, scroller] of this.columnScrollers) {
+			const scrollContainer = (scroller as any).scrollContainer as HTMLElement | undefined;
+			if (scrollContainer) {
+				columnScroll[columnKey] = scrollContainer.scrollTop;
+			}
+		}
+
+		// Save scroll position for non-virtual columns (direct DOM elements)
+		if (this.boardEl) {
+			const columns = this.boardEl.querySelectorAll(".kanban-view__column");
+			columns.forEach((column) => {
+				const groupKey = column.getAttribute("data-group");
+				const cardsContainer = column.querySelector(".kanban-view__cards") as HTMLElement;
+				if (groupKey && cardsContainer && !(groupKey in columnScroll)) {
+					columnScroll[groupKey] = cardsContainer.scrollTop;
+				}
+			});
+
+			// Also save swimlane cell scroll positions (class is kanban-view__swimlane-column)
+			const swimlaneCells = this.boardEl.querySelectorAll(".kanban-view__swimlane-column");
+			swimlaneCells.forEach((cell) => {
+				const columnKey = cell.getAttribute("data-column");
+				const swimlaneKey = cell.getAttribute("data-swimlane");
+				if (columnKey && swimlaneKey) {
+					const cellKey = `${swimlaneKey}:${columnKey}`;
+					const tasksContainer = cell.querySelector(
+						".kanban-view__tasks-container"
+					) as HTMLElement;
+					if (tasksContainer && !(cellKey in columnScroll)) {
+						columnScroll[cellKey] = tasksContainer.scrollTop;
+					}
+				}
+			});
+		}
+
+		return {
+			scrollTop: this.rootElement?.scrollTop || 0,
+			columnScroll,
+		};
+	}
+
+	/**
+	 * Restore ephemeral state including scroll positions for all columns.
+	 */
+	setEphemeralState(state: any): void {
+		if (!state) return;
+
+		// Restore board-level horizontal scroll
+		if (state.scrollTop !== undefined && this.rootElement) {
+			requestAnimationFrame(() => {
+				if (this.rootElement && this.rootElement.isConnected) {
+					this.rootElement.scrollTop = state.scrollTop;
+				}
+			});
+		}
+
+		// Restore column scroll positions after render completes
+		if (state.columnScroll && typeof state.columnScroll === "object") {
+			// Use requestAnimationFrame to ensure DOM and VirtualScrollers are ready
+			requestAnimationFrame(() => {
+				// Restore virtual scroller positions
+				for (const [columnKey, scroller] of this.columnScrollers) {
+					const scrollTop = state.columnScroll[columnKey];
+					if (scrollTop !== undefined) {
+						const scrollContainer = (scroller as any).scrollContainer as
+							| HTMLElement
+							| undefined;
+						if (scrollContainer) {
+							scrollContainer.scrollTop = scrollTop;
+						}
+					}
+				}
+
+				// Restore non-virtual column positions
+				if (this.boardEl) {
+					const columns = this.boardEl.querySelectorAll(".kanban-view__column");
+					columns.forEach((column) => {
+						const groupKey = column.getAttribute("data-group");
+						if (groupKey && state.columnScroll[groupKey] !== undefined) {
+							const cardsContainer = column.querySelector(
+								".kanban-view__cards"
+							) as HTMLElement;
+							if (cardsContainer && !this.columnScrollers.has(groupKey)) {
+								cardsContainer.scrollTop = state.columnScroll[groupKey];
+							}
+						}
+					});
+
+					// Restore swimlane cell positions (class is kanban-view__swimlane-column)
+					const swimlaneCells = this.boardEl.querySelectorAll(
+						".kanban-view__swimlane-column"
+					);
+					swimlaneCells.forEach((cell) => {
+						const columnKey = cell.getAttribute("data-column");
+						const swimlaneKey = cell.getAttribute("data-swimlane");
+						if (columnKey && swimlaneKey) {
+							const cellKey = `${swimlaneKey}:${columnKey}`;
+							if (state.columnScroll[cellKey] !== undefined) {
+								const tasksContainer = cell.querySelector(
+									".kanban-view__tasks-container"
+								) as HTMLElement;
+								if (tasksContainer && !this.columnScrollers.has(cellKey)) {
+									tasksContainer.scrollTop = state.columnScroll[cellKey];
+								}
+							}
+						}
+					});
+				}
+			});
+		}
+	}
+
+	async render(): Promise<void> {
+		if (!this.boardEl || !this.rootElement) return;
+		if (!this.data?.data) return;
+
+		this.debugLog("RENDER-START", {
+			activeDropCount: this.activeDropCount,
+			suppressRenderRemaining: Math.max(0, this.suppressRenderUntil - Date.now()),
+			draggedTaskPath: this.draggedTaskPath?.split("/").pop() || null,
+			currentTaskElementsCount: this.currentTaskElements.size,
+		});
+
+		// Always re-read view options to catch config changes (e.g., toggling consolidateStatusIcon)
+		if (this.config) {
+			this.readViewOptions();
+		}
+
+		// Now that config is loaded, setup search (idempotent: will only create once)
+		if (this.rootElement) {
+			this.setupSearch(this.rootElement);
+		}
+
+		try {
+			const dataItems = this.dataAdapter.extractDataItems();
+
+			// Compute formulas before reading formula-based properties (swimlanes, etc.)
+			await this.computeFormulas(dataItems);
+
+			const taskNotes = await identifyTaskNotesFromBasesData(dataItems, this.plugin);
+
+			// Apply search filter
+			const filteredTasks = this.applySearchFilter(taskNotes);
+			this.setCurrentVisibleTaskPaths(filteredTasks);
+
+			// Clear board and cleanup scrollers
+			this.destroyColumnScrollers();
+			this.boardEl.empty();
+			this.sortScopeTaskPaths.clear();
+			this.sortScopeCandidateTaskPaths.clear();
+
+			if (filteredTasks.length === 0) {
+				// Show "no results" if search returned empty but we had tasks
+				if (this.isSearchWithNoResults(filteredTasks, taskNotes.length)) {
+					this.renderSearchNoResults(this.boardEl);
+				} else {
+					this.renderEmptyState();
+				}
+				return;
+			}
+
+			// Build path -> props map for dynamic property access
+			const pathToProps = this.buildPathToPropsMap();
+
+			// Determine groupBy property ID
+			const groupByPropertyId = this.getGroupByPropertyId();
+
+			if (!groupByPropertyId) {
+				// No groupBy - show error
+				this.renderNoGroupByError();
+				return;
+			}
+
+			// Group tasks
+			const groups = this.groupTasks(filteredTasks, groupByPropertyId, pathToProps);
+			const allGroups = this.groupTasks(taskNotes, groupByPropertyId, pathToProps);
+
+			// Render swimlanes if configured
+			if (this.swimLanePropertyId) {
+				await this.renderWithSwimLanes(
+					groups,
+					filteredTasks,
+					allGroups,
+					taskNotes,
+					pathToProps,
+					groupByPropertyId
+				);
+			} else {
+				await this.renderFlat(groups, allGroups);
+			}
+		} catch (error: any) {
+			console.error("[TaskNotes][KanbanView] Error rendering:", error);
+			this.renderError(error);
+		}
+	}
+
+	private getGroupByPropertyId(): string | null {
+		// IMPORTANT: Public API doesn't expose groupBy property!
+		// Must use internal API to detect if groupBy is configured.
+		// We can't rely on isGrouped() because it returns false when all items have null values.
+
+		const controller = this.basesController;
+
+		// Try to get groupBy from internal API (controller.query.views)
+		if (controller?.query?.views && controller?.viewName) {
+			const views = controller.query.views;
+			const viewName = controller.viewName;
+
+			for (let i = 0; i < views.length; i++) {
+				const view = views[i];
+				if (view && view.name === viewName) {
+					if (view.groupBy) {
+						if (typeof view.groupBy === "object" && view.groupBy.property) {
+							return view.groupBy.property;
+						} else if (typeof view.groupBy === "string") {
+							return view.groupBy;
+						}
+					}
+
+					// View found but no groupBy configured
+					return null;
+				}
+			}
+		}
+
+		return null;
+	}
+
+	private getSortScopeKey(groupKey: string, swimLaneKey: string | null = null): string {
+		return swimLaneKey === null ? groupKey : `${swimLaneKey}::${groupKey}`;
+	}
+
+	private getVisibleSortScopePaths(groupKey: string, swimLaneKey: string | null = null): string[] | undefined {
+		return this.sortScopeTaskPaths.get(this.getSortScopeKey(groupKey, swimLaneKey));
+	}
+
+	private getCandidateSortScopePaths(groupKey: string, swimLaneKey: string | null = null): string[] | undefined {
+		return this.sortScopeCandidateTaskPaths.get(this.getSortScopeKey(groupKey, swimLaneKey));
+	}
+
+	private setSortScopeCandidatePaths(entries: Iterable<[string, string[]]>): void {
+		this.sortScopeCandidateTaskPaths.clear();
+		for (const [scopeKey, paths] of entries) {
+			this.sortScopeCandidateTaskPaths.set(scopeKey, [...paths]);
+		}
+	}
+
+	private async confirmLargeReorder(
+		editCount: number,
+		groupKey: string,
+		swimLaneKey: string | null
+	): Promise<boolean> {
+		const sortOrderField = this.plugin.settings.fieldMapping.sortOrder;
+		const scopeLabel = swimLaneKey === null
+			? this.plugin.i18n.translate("views.kanban.reorder.scope.column", { group: groupKey })
+			: this.plugin.i18n.translate("views.kanban.reorder.scope.columnInSwimlane", {
+				group: groupKey,
+				swimlane: swimLaneKey,
+			});
+
+		return showConfirmationModal(this.plugin.app, {
+			title: this.plugin.i18n.translate("common.reorder.confirmLargeTitle"),
+			message: this.plugin.i18n.translate("common.reorder.confirmLargeMessage", {
+				field: sortOrderField,
+				count: editCount,
+				scope: scopeLabel,
+			}),
+			confirmText: this.plugin.i18n.translate("common.reorder.confirmButton"),
+			cancelText: this.plugin.i18n.translate("common.cancel"),
+		});
+	}
+
+	private groupTasks(
+		taskNotes: TaskInfo[],
+		groupByPropertyId: string,
+		pathToProps: Map<string, Record<string, any>>
+	): Map<string, TaskInfo[]> {
+		const groups = new Map<string, TaskInfo[]>();
+
+		// Check if we should explode list properties into multiple columns
+		const cleanGroupBy = stripPropertyPrefix(groupByPropertyId);
+		const shouldExplode = this.explodeListColumns && this.isListTypeProperty(cleanGroupBy);
+
+		if (shouldExplode) {
+			// For list properties (contexts, tags, projects, etc.), "explode" so tasks appear
+			// in each individual column rather than a single combined column.
+			// This matches user expectations: a task with contexts ["work", "call"]
+			// should appear in both the "work" column AND the "call" column.
+			for (const task of taskNotes) {
+				// Get value from TaskInfo directly (already properly mapped) or fall back to pathToProps
+				const value = this.getListPropertyValue(task, cleanGroupBy, pathToProps);
+
+				if (Array.isArray(value) && value.length > 0) {
+					// Add task to each individual value's column
+					for (const item of value) {
+						const columnKey = String(item) || "None";
+						if (!groups.has(columnKey)) {
+							groups.set(columnKey, []);
+						}
+						groups.get(columnKey)!.push(task);
+					}
+				} else {
+					// No values or not an array - put in "None" column
+					const columnKey = "None";
+					if (!groups.has(columnKey)) {
+						groups.set(columnKey, []);
+					}
+					groups.get(columnKey)!.push(task);
+				}
+			}
+		} else {
+			// For non-list properties (or when explode is disabled), use Bases grouped data directly
+			// Note: We can't rely on isGrouped() because it returns false when all items have null values
+			const basesGroups = this.dataAdapter.getGroupedData();
+			const tasksByPath = new Map(taskNotes.map((t) => [t.path, t]));
+
+			for (const group of basesGroups) {
+				const groupKey = this.dataAdapter.convertGroupKeyToString(group.key);
+				const groupTasks: TaskInfo[] = [];
+
+				for (const entry of group.entries) {
+					const task = tasksByPath.get(entry.file.path);
+					if (task) groupTasks.push(task);
+				}
+
+				groups.set(groupKey, groupTasks);
+			}
+		}
+
+		// Re-sort each group by sort_order from live metadata cache
+		// (Bases' internal data may be stale after a drag-to-reorder write)
+		const sortOrderField = this.plugin.settings.fieldMapping.sortOrder;
+		if (isSortOrderInSortConfig(this.dataAdapter, sortOrderField)) {
+			for (const [, tasks] of groups) {
+				tasks.sort((a, b) => {
+					const fmA = this.plugin.app.metadataCache.getFileCache(
+						this.plugin.app.vault.getAbstractFileByPath(a.path) as TFile
+					)?.frontmatter;
+					const fmB = this.plugin.app.metadataCache.getFileCache(
+						this.plugin.app.vault.getAbstractFileByPath(b.path) as TFile
+					)?.frontmatter;
+					const soA = fmA?.[sortOrderField];
+					const soB = fmB?.[sortOrderField];
+					if (soA != null && soB != null) return String(soA).localeCompare(String(soB));
+					if (soA != null) return -1;
+					if (soB != null) return 1;
+					return 0;
+				});
+			}
+		}
+
+		// Augment with empty status columns if grouping by status
+		this.augmentWithEmptyStatusColumns(groups, groupByPropertyId);
+
+		// Augment with empty priority columns if grouping by priority
+		this.augmentWithEmptyPriorityColumns(groups, groupByPropertyId);
+
+		return groups;
+	}
+
+	/**
+	 * Check if a property is a list-type that should show tasks in multiple columns.
+	 * Uses Obsidian's metadataTypeManager to dynamically detect property types.
+	 */
+	private isListTypeProperty(propertyName: string): boolean {
+		// Check Obsidian's property type registry
+		const metadataTypeManager = (this.plugin.app as any).metadataTypeManager;
+		if (metadataTypeManager?.properties) {
+			const propertyInfo = metadataTypeManager.properties[propertyName.toLowerCase()];
+			if (propertyInfo?.type) {
+				// Obsidian list types: "multitext", "tags", "aliases"
+				const listTypes = new Set(["multitext", "tags", "aliases"]);
+				if (listTypes.has(propertyInfo.type)) {
+					return true;
+				}
+			}
+		}
+
+		// Fallback: check against known TaskNotes list properties
+		// (in case metadataTypeManager doesn't have the property registered)
+		const contextsField = this.plugin.fieldMapper.toUserField("contexts");
+		const projectsField = this.plugin.fieldMapper.toUserField("projects");
+
+		const knownListProperties = new Set([
+			"contexts",
+			contextsField,
+			"projects",
+			projectsField,
+			"tags",
+			"aliases",
+		]);
+
+		return knownListProperties.has(propertyName);
+	}
+
+	/**
+	 * Get the value of a list property from a task.
+	 * Tries TaskInfo properties first (already properly mapped), then falls back to pathToProps.
+	 */
+	private getListPropertyValue(
+		task: TaskInfo,
+		propertyName: string,
+		pathToProps: Map<string, Record<string, any>>
+	): any {
+		// Map user field names to TaskInfo property names
+		const contextsField = this.plugin.fieldMapper.toUserField("contexts");
+		const projectsField = this.plugin.fieldMapper.toUserField("projects");
+
+		// Check if property matches known TaskInfo list properties
+		if (propertyName === "contexts" || propertyName === contextsField) {
+			return task.contexts;
+		}
+		if (propertyName === "projects" || propertyName === projectsField) {
+			return task.projects;
+		}
+		if (propertyName === "tags") {
+			return task.tags;
+		}
+
+		// Fall back to pathToProps for custom list properties
+		const props = pathToProps.get(task.path) || {};
+		return props[propertyName];
+	}
+
+	/**
+	 * Augment groups with empty columns for user-defined statuses.
+	 * Only applies when grouping by status property.
+	 */
+	private augmentWithEmptyStatusColumns(
+		groups: Map<string, TaskInfo[]>,
+		groupByPropertyId: string
+	): void {
+		// Check if we're grouping by status
+		// Compare the groupBy property against the user's configured status field name
+		const statusPropertyName = this.plugin.fieldMapper.toUserField("status");
+
+		// The groupByPropertyId from Bases might have a prefix (e.g., "note.status")
+		// Strip the prefix to compare against the field name
+		const cleanGroupBy = groupByPropertyId.replace(/^(note\.|file\.|task\.)/, "");
+
+		if (cleanGroupBy !== statusPropertyName) {
+			return; // Not grouping by status, don't augment
+		}
+
+		// Get all user-defined statuses from settings
+		const customStatuses = this.plugin.settings.customStatuses;
+		if (!customStatuses || customStatuses.length === 0) {
+			return; // No custom statuses defined
+		}
+
+		// Add empty groups for any status values not already present
+		for (const statusConfig of customStatuses) {
+			// Use the status value (what gets written to YAML) as the group key
+			const statusValue = statusConfig.value;
+
+			if (!groups.has(statusValue)) {
+				// This status has no tasks - add an empty group
+				groups.set(statusValue, []);
+			}
+		}
+	}
+
+	/**
+	 * Augment groups with empty columns for user-defined priorities.
+	 * Only applies when grouping by priority property.
+	 */
+	private augmentWithEmptyPriorityColumns(
+		groups: Map<string, TaskInfo[]>,
+		groupByPropertyId: string
+	): void {
+		// Check if we're grouping by priority
+		// Compare the groupBy property against the user's configured priority field name
+		const priorityPropertyName = this.plugin.fieldMapper.toUserField("priority");
+
+		// The groupByPropertyId from Bases might have a prefix (e.g., "note.priority" or "task.priority")
+		// Strip the prefix to compare against the field name
+		const cleanGroupBy = groupByPropertyId.replace(/^(note\.|file\.|task\.)/, "");
+
+		if (cleanGroupBy !== priorityPropertyName) {
+			return; // Not grouping by priority, don't augment
+		}
+
+		// Get all user-defined priorities from the priority manager
+		const customPriorities = this.plugin.priorityManager.getAllPriorities();
+		if (!customPriorities || customPriorities.length === 0) {
+			return; // No custom priorities defined
+		}
+
+		// Add empty groups for any priority values not already present
+		for (const priorityConfig of customPriorities) {
+			// Use the priority value (what gets written to YAML) as the group key
+			const priorityValue = priorityConfig.value;
+
+			if (!groups.has(priorityValue)) {
+				// This priority has no tasks - add an empty group
+				groups.set(priorityValue, []);
+			}
+		}
+	}
+
+	private async renderFlat(
+		groups: Map<string, TaskInfo[]>,
+		allGroups: Map<string, TaskInfo[]>
+	): Promise<void> {
+		if (!this.boardEl) return;
+		this.sortScopeTaskPaths.clear();
+		this.setSortScopeCandidatePaths(
+			Array.from(allGroups.entries()).map(([groupKey, tasks]) => [
+				this.getSortScopeKey(groupKey),
+				tasks.map((task) => task.path),
+			])
+		);
+
+		// Set CSS variable for column width (allows responsive override)
+		this.boardEl.style.setProperty("--kanban-column-width", `${this.columnWidth}px`);
+
+		// Render columns without swimlanes
+		const visibleProperties = this.getVisibleProperties();
+
+		// Tasks are re-sorted by sort_order in groupTasks() when configured,
+		// ensuring correct order even if Bases' internal data hasn't refreshed yet.
+
+		// Get groupBy property ID
+		const groupByPropertyId = this.getGroupByPropertyId();
+
+		// Get column keys and apply ordering
+		const columnKeys = Array.from(groups.keys());
+		const orderedKeys = groupByPropertyId
+			? this.applyColumnOrder(groupByPropertyId, columnKeys)
+			: columnKeys;
+
+		for (const groupKey of orderedKeys) {
+			const tasks = groups.get(groupKey) || [];
+
+			// Filter empty columns if option enabled
+			if (this.hideEmptyColumns && tasks.length === 0) {
+				continue;
+			}
+
+			this.sortScopeTaskPaths.set(this.getSortScopeKey(groupKey), tasks.map((task) => task.path));
+
+			// Create column
+			const column = await this.createColumn(groupKey, tasks, visibleProperties);
+			if (this.boardEl) {
+				this.boardEl.appendChild(column);
+			}
+		}
+	}
+
+	private async renderWithSwimLanes(
+		groups: Map<string, TaskInfo[]>,
+		allTasks: TaskInfo[],
+		allGroups: Map<string, TaskInfo[]>,
+		allTasksForCandidateScopes: TaskInfo[],
+		pathToProps: Map<string, Record<string, any>>,
+		groupByPropertyId: string
+	): Promise<void> {
+		if (!this.swimLanePropertyId) return;
+		this.sortScopeTaskPaths.clear();
+
+		// Group by swimlane first, then by column within each swimlane
+		const swimLanes = new Map<string, Map<string, TaskInfo[]>>();
+
+		// Get all unique swimlane values
+		const swimLaneValues = new Set<string>();
+
+		for (const task of allTasks) {
+			const props = pathToProps.get(task.path) || {};
+			const swimLaneValue = this.getPropertyValue(props, this.swimLanePropertyId);
+			const swimLaneKey = this.valueToString(swimLaneValue);
+			swimLaneValues.add(swimLaneKey);
+		}
+
+		// Initialize swimlane -> column -> tasks structure
+		// Note: groups already includes empty status columns from augmentWithEmptyStatusColumns()
+		for (const swimLaneKey of swimLaneValues) {
+			const swimLaneMap = new Map<string, TaskInfo[]>();
+			swimLanes.set(swimLaneKey, swimLaneMap);
+
+			// Initialize each column in this swimlane (including empty status columns)
+			for (const [columnKey] of groups) {
+				swimLaneMap.set(columnKey, []);
+			}
+		}
+
+		// Distribute tasks into swimlane + column cells.
+		//
+		// IMPORTANT: Always use the already-built `groups` map for the column assignment.
+		// In swimlane mode we previously re-computed the column key from `pathToProps`
+		// (including `formula.*` cached outputs). After a frontmatter edit, Bases may
+		// update `groupedData` promptly, but cached formula outputs can lag behind, which
+		// caused tasks to temporarily fall into the "None" column until the query re-runs
+		// (e.g., changing sort or reloading Obsidian). Using `groups` keeps swimlane mode
+		// consistent with flat mode and with Bases' computed grouping.
+		for (const [columnKey, columnTasks] of groups) {
+			for (const task of columnTasks) {
+				const props = pathToProps.get(task.path) || {};
+				const swimLaneValue = this.getPropertyValue(props, this.swimLanePropertyId);
+				const swimLaneKey = this.valueToString(swimLaneValue);
+
+				const swimLane = swimLanes.get(swimLaneKey);
+				if (!swimLane) continue;
+
+				if (swimLane.has(columnKey)) {
+					swimLane.get(columnKey)!.push(task);
+				}
+			}
+		}
+
+		const candidateSwimLanes = new Map<string, Map<string, TaskInfo[]>>();
+		const candidateSwimLaneValues = new Set<string>();
+
+		for (const task of allTasksForCandidateScopes) {
+			const props = pathToProps.get(task.path) || {};
+			const swimLaneValue = this.getPropertyValue(props, this.swimLanePropertyId);
+			const swimLaneKey = this.valueToString(swimLaneValue);
+			candidateSwimLaneValues.add(swimLaneKey);
+		}
+
+		for (const swimLaneKey of candidateSwimLaneValues) {
+			const swimLaneMap = new Map<string, TaskInfo[]>();
+			candidateSwimLanes.set(swimLaneKey, swimLaneMap);
+
+			for (const [columnKey] of allGroups) {
+				swimLaneMap.set(columnKey, []);
+			}
+		}
+
+		for (const [columnKey, columnTasks] of allGroups) {
+			for (const task of columnTasks) {
+				const props = pathToProps.get(task.path) || {};
+				const swimLaneValue = this.getPropertyValue(props, this.swimLanePropertyId);
+				const swimLaneKey = this.valueToString(swimLaneValue);
+				const swimLane = candidateSwimLanes.get(swimLaneKey);
+				if (!swimLane) continue;
+				if (swimLane.has(columnKey)) {
+					swimLane.get(columnKey)!.push(task);
+				}
+			}
+		}
+
+		this.setSortScopeCandidatePaths(
+			Array.from(candidateSwimLanes.entries()).flatMap(([swimLaneKey, columns]) =>
+				Array.from(columns.entries()).map(([columnKey, tasks]) => [
+					this.getSortScopeKey(columnKey, swimLaneKey),
+					tasks.map((task) => task.path),
+				] as [string, string[]])
+			)
+		);
+
+		// Apply column ordering
+		const columnKeys = Array.from(groups.keys());
+		const orderedKeys = this.applyColumnOrder(groupByPropertyId, columnKeys);
+
+		// Render swimlane table
+		await this.renderSwimLaneTable(swimLanes, orderedKeys, pathToProps);
+	}
+
+	private async renderSwimLaneTable(
+		swimLanes: Map<string, Map<string, TaskInfo[]>>,
+		columnKeys: string[],
+		pathToProps: Map<string, Record<string, any>>
+	): Promise<void> {
+		if (!this.boardEl) return;
+
+		// Set CSS variables for column width and swimlane max height
+		this.boardEl.style.setProperty("--kanban-column-width", `${this.columnWidth}px`);
+		this.boardEl.style.setProperty(
+			"--kanban-swimlane-max-height",
+			`${this.maxSwimlaneHeight}px`
+		);
+
+		// Add swimlanes class to board
+		this.boardEl.addClass("kanban-view__board--swimlanes");
+
+		// Create header row
+		const headerRow = this.boardEl.createEl("div", {
+			cls: "kanban-view__swimlane-row kanban-view__swimlane-row--header",
+		});
+
+		// Empty corner cell for swimlane label column
+		headerRow.createEl("div", { cls: "kanban-view__swimlane-label" });
+
+		// Column headers
+		for (const columnKey of columnKeys) {
+			const headerCell = headerRow.createEl("div", {
+				cls: "kanban-view__column-header-cell",
+			});
+			headerCell.setAttribute("draggable", "true");
+			headerCell.setAttribute("data-column-key", columnKey);
+
+			// Drag handle
+			const dragHandle = headerCell.createSpan({ cls: "kanban-view__drag-handle" });
+			dragHandle.textContent = "⋮⋮";
+
+			// Status icon (when consolidation enabled and grouped by status)
+			if (this.consolidateStatusIcon && this.isGroupedByStatus()) {
+				const statusConfig = this.plugin.statusManager.getStatusConfig(columnKey);
+				if (statusConfig?.icon) {
+					const iconEl = headerCell.createSpan({ cls: "kanban-view__column-icon" });
+					iconEl.style.color = statusConfig.color;
+					setIcon(iconEl, statusConfig.icon);
+				}
+			}
+
+			const titleContainer = headerCell.createSpan({ cls: "kanban-view__column-title" });
+			this.renderGroupTitleWrapper(titleContainer, columnKey, false, true);
+
+			// Setup column header drag handlers for swimlane mode
+			this.setupColumnHeaderDragHandlers(headerCell);
+		}
+
+		// Get visible properties for cards
+		const visibleProperties = this.getVisibleProperties();
+
+		// Note: tasks are already sorted by Bases
+		// No manual sorting needed - Bases provides pre-sorted data
+
+		// Render each swimlane row
+		for (const [swimLaneKey, columns] of swimLanes) {
+			const row = this.boardEl.createEl("div", { cls: "kanban-view__swimlane-row" });
+
+			// Swimlane label cell
+			const labelCell = row.createEl("div", { cls: "kanban-view__swimlane-label" });
+
+			// Add swimlane title and count
+			const titleEl = labelCell.createEl("div", { cls: "kanban-view__swimlane-title" });
+			this.renderGroupTitleWrapper(titleEl, swimLaneKey, true);
+
+			// Count total tasks in this swimlane
+			const totalTasks = Array.from(columns.values()).reduce(
+				(sum, tasks) => sum + tasks.length,
+				0
+			);
+			labelCell.createEl("div", {
+				cls: "kanban-view__swimlane-count",
+				text: `${totalTasks}`,
+			});
+
+			// Render columns in this swimlane
+			for (const columnKey of columnKeys) {
+				const tasks = columns.get(columnKey) || [];
+				this.sortScopeTaskPaths.set(
+					this.getSortScopeKey(columnKey, swimLaneKey),
+					tasks.map((task) => task.path)
+				);
+
+				// Create cell
+				const cell = row.createEl("div", {
+					cls: "kanban-view__swimlane-column",
+					attr: {
+						"data-column": columnKey,
+						"data-swimlane": swimLaneKey,
+					},
+				});
+
+				// Setup drop handlers for this cell
+				this.setupSwimLaneCellDragDrop(cell, columnKey, swimLaneKey);
+
+				// Create tasks container inside the cell
+				const tasksContainer = cell.createDiv({ cls: "kanban-view__tasks-container" });
+
+				// Use virtual scrolling for cells with 30+ tasks
+				if (tasks.length >= this.VIRTUAL_SCROLL_THRESHOLD) {
+					await this.createVirtualSwimLaneCell(
+						tasksContainer,
+						`${swimLaneKey}:${columnKey}`,
+						tasks,
+						visibleProperties
+					);
+				} else {
+					// Render tasks normally for smaller cells
+					const cardOptions = this.getCardOptions();
+					for (const task of tasks) {
+						const cardWrapper = tasksContainer.createDiv({
+							cls: "kanban-view__card-wrapper",
+						});
+						cardWrapper.setAttribute("draggable", "true");
+						cardWrapper.setAttribute("data-task-path", task.path);
+
+						const card = createTaskCard(
+							task,
+							this.plugin,
+							visibleProperties,
+							cardOptions
+						);
+
+						cardWrapper.appendChild(card);
+						this.currentTaskElements.set(task.path, cardWrapper);
+						this.taskInfoCache.set(task.path, task);
+
+						// Setup card drag handlers
+						this.setupCardDragHandlers(cardWrapper, task);
+					}
+				}
+			}
+		}
+	}
+
+	private async createColumn(
+		groupKey: string,
+		tasks: TaskInfo[],
+		visibleProperties: string[]
+	): Promise<HTMLElement> {
+		// Use containerEl.ownerDocument for pop-out window support
+		const doc = this.containerEl.ownerDocument;
+		const column = doc.createElement("div");
+		column.className = "kanban-view__column";
+		column.style.width = `${this.columnWidth}px`;
+		column.setAttribute("data-group", groupKey);
+
+		// Column header
+		const header = column.createDiv({ cls: "kanban-view__column-header" });
+		header.setAttribute("draggable", "true");
+		header.setAttribute("data-column-key", groupKey);
+
+		// Drag handle
+		const dragHandle = header.createSpan({ cls: "kanban-view__drag-handle" });
+		dragHandle.textContent = "⋮⋮";
+
+		// Status icon (when consolidation enabled and grouped by status)
+		if (this.consolidateStatusIcon && this.isGroupedByStatus()) {
+			const statusConfig = this.plugin.statusManager.getStatusConfig(groupKey);
+			if (statusConfig?.icon) {
+				const iconEl = header.createSpan({ cls: "kanban-view__column-icon" });
+				iconEl.style.color = statusConfig.color;
+				setIcon(iconEl, statusConfig.icon);
+			}
+		}
+
+		const titleContainer = header.createSpan({ cls: "kanban-view__column-title" });
+		this.renderGroupTitleWrapper(titleContainer, groupKey, false, true);
+
+		header.createSpan({
+			cls: "kanban-view__column-count",
+			text: ` (${tasks.length})`,
+		});
+
+		// Setup column header drag handlers
+		this.setupColumnHeaderDragHandlers(header);
+
+		// Cards container
+		const cardsContainer = column.createDiv({ cls: "kanban-view__cards" });
+
+		// Setup drag-and-drop for cards
+		this.setupColumnDragDrop(column, cardsContainer, groupKey);
+
+		const cardOptions = this.getCardOptions();
+
+		// Use virtual scrolling for columns with many cards
+		if (tasks.length >= this.VIRTUAL_SCROLL_THRESHOLD) {
+			this.createVirtualColumn(
+				cardsContainer,
+				groupKey,
+				tasks,
+				visibleProperties,
+				cardOptions
+			);
+		} else {
+			this.createNormalColumn(cardsContainer, tasks, visibleProperties, cardOptions);
+		}
+
+		return column;
+	}
+
+	private createVirtualColumn(
+		cardsContainer: HTMLElement,
+		groupKey: string,
+		tasks: TaskInfo[],
+		visibleProperties: string[],
+		cardOptions: any
+	): void {
+		// Use semantic class instead of inline style for easier maintenance.
+		cardsContainer.addClass("kanban-view__cards--virtual");
+
+		// Use containerEl.ownerDocument for pop-out window support
+		const doc = this.containerEl.ownerDocument;
+		const scroller = new VirtualScroller<TaskInfo>({
+			container: cardsContainer,
+			items: tasks,
+			// itemHeight omitted - automatically calculated from sample
+			overscan: 3,
+			renderItem: (task: TaskInfo) => {
+				const cardWrapper = doc.createElement("div");
+				cardWrapper.className = "kanban-view__card-wrapper";
+				cardWrapper.setAttribute("draggable", "true");
+				cardWrapper.setAttribute("data-task-path", task.path);
+
+				const card = createTaskCard(task, this.plugin, visibleProperties, cardOptions);
+				cardWrapper.appendChild(card);
+
+				this.taskInfoCache.set(task.path, task);
+				this.setupCardDragHandlers(cardWrapper, task);
+
+				return cardWrapper;
+			},
+			getItemKey: (task: TaskInfo) => task.path,
+		});
+
+		this.columnScrollers.set(groupKey, scroller);
+	}
+
+	private async createVirtualSwimLaneCell(
+		tasksContainer: HTMLElement,
+		cellKey: string,
+		tasks: TaskInfo[],
+		visibleProperties: string[]
+	): Promise<void> {
+		// Use semantic class instead of inline style for easier maintenance.
+		tasksContainer.addClass("kanban-view__tasks-container--virtual");
+
+		const cardOptions = this.getCardOptions();
+
+		// Use containerEl.ownerDocument for pop-out window support
+		const doc = this.containerEl.ownerDocument;
+		const scroller = new VirtualScroller<TaskInfo>({
+			container: tasksContainer,
+			items: tasks,
+			// itemHeight omitted - automatically calculated from sample
+			overscan: 3,
+			renderItem: (task: TaskInfo) => {
+				const cardWrapper = doc.createElement("div");
+				cardWrapper.className = "kanban-view__card-wrapper";
+				cardWrapper.setAttribute("draggable", "true");
+				cardWrapper.setAttribute("data-task-path", task.path);
+
+				const card = createTaskCard(task, this.plugin, visibleProperties, cardOptions);
+
+				cardWrapper.appendChild(card);
+
+				this.taskInfoCache.set(task.path, task);
+				this.setupCardDragHandlers(cardWrapper, task);
+
+				return cardWrapper;
+			},
+			getItemKey: (task: TaskInfo) => task.path,
+		});
+
+		this.columnScrollers.set(cellKey, scroller);
+	}
+
+	private createNormalColumn(
+		cardsContainer: HTMLElement,
+		tasks: TaskInfo[],
+		visibleProperties: string[],
+		cardOptions: any
+	): void {
+		for (const task of tasks) {
+			const cardWrapper = cardsContainer.createDiv({ cls: "kanban-view__card-wrapper" });
+			cardWrapper.setAttribute("draggable", "true");
+			cardWrapper.setAttribute("data-task-path", task.path);
+
+			const card = createTaskCard(task, this.plugin, visibleProperties, cardOptions);
+
+			cardWrapper.appendChild(card);
+			this.currentTaskElements.set(task.path, cardWrapper);
+			this.taskInfoCache.set(task.path, task);
+
+			// Setup card drag handlers
+			this.setupCardDragHandlers(cardWrapper, task);
+		}
+	}
+
+	private setupColumnHeaderDragHandlers(header: HTMLElement): void {
+		const columnKey = header.dataset.columnKey;
+		if (!columnKey) return;
+
+		// Determine if this is a swimlane header or regular column header
+		const isSwimlaneHeader = header.classList.contains("kanban-view__column-header-cell");
+		const draggingClass = isSwimlaneHeader
+			? "kanban-view__column-header-cell--dragging"
+			: "kanban-view__column-header--dragging";
+		const dragoverClass = isSwimlaneHeader
+			? "kanban-view__column-header-cell--dragover"
+			: "kanban-view__column-header--dragover";
+
+		header.addEventListener("dragstart", (e: DragEvent) => {
+			if (!e.dataTransfer) return;
+			e.dataTransfer.effectAllowed = "move";
+			e.dataTransfer.setData("text/x-kanban-column", columnKey);
+			header.classList.add(draggingClass);
+		});
+
+		header.addEventListener("dragover", (e: DragEvent) => {
+			// Only handle column drags (not task drags)
+			if (!e.dataTransfer?.types.includes("text/x-kanban-column")) return;
+			e.preventDefault();
+			e.stopPropagation();
+			e.dataTransfer.dropEffect = "move";
+
+			// Add visual feedback for drop target
+			header.classList.add(dragoverClass);
+		});
+
+		header.addEventListener("dragleave", (e: DragEvent) => {
+			// Only handle column drags
+			if (!e.dataTransfer?.types.includes("text/x-kanban-column")) return;
+			if (e.target === header) {
+				header.classList.remove(dragoverClass);
+			}
+		});
+
+		header.addEventListener("drop", async (e: DragEvent) => {
+			// Only handle column drags (not task drags)
+			if (!e.dataTransfer?.types.includes("text/x-kanban-column")) return;
+			e.preventDefault();
+			e.stopPropagation();
+
+			// Remove visual feedback
+			header.classList.remove(dragoverClass);
+
+			const draggedKey = e.dataTransfer.getData("text/x-kanban-column");
+			const targetKey = header.dataset.columnKey;
+			if (!targetKey || !draggedKey || draggedKey === targetKey) return;
+
+			// Get current groupBy property
+			const groupBy = this.getGroupByPropertyId();
+			if (!groupBy) return;
+
+			// Get current column order from DOM (supports both flat and swimlane modes)
+			const selector = isSwimlaneHeader
+				? ".kanban-view__column-header-cell"
+				: ".kanban-view__column-header";
+			const currentOrder = Array.from(this.boardEl!.querySelectorAll(selector))
+				.map((el) => (el as HTMLElement).dataset.columnKey)
+				.filter(Boolean) as string[];
+
+			// Calculate new order
+			const dragIndex = currentOrder.indexOf(draggedKey);
+			const dropIndex = currentOrder.indexOf(targetKey);
+
+			const newOrder = [...currentOrder];
+			newOrder.splice(dragIndex, 1);
+			newOrder.splice(dropIndex, 0, draggedKey);
+
+			// Save new order
+			await this.saveColumnOrder(groupBy, newOrder);
+
+			// Re-render
+			await this.render();
+		});
+
+		header.addEventListener("dragend", () => {
+			header.classList.remove(draggingClass);
+		});
+
+		this.setupColumnHeaderTouchHandlers(
+			header,
+			columnKey,
+			isSwimlaneHeader,
+			draggingClass
+		);
+	}
+
+	private setupColumnHeaderTouchHandlers(
+		header: HTMLElement,
+		columnKey: string,
+		isSwimlaneHeader: boolean,
+		draggingClass: string
+	): void {
+		if (!Platform.isMobile) return;
+
+		header.addEventListener("contextmenu", (e: MouseEvent) => {
+			if (this.longPressTimer || this.touchDragActive) {
+				e.preventDefault();
+				e.stopPropagation();
+			}
+		});
+
+		header.addEventListener(
+			"touchstart",
+			(e: TouchEvent) => {
+				if (e.touches.length !== 1) return;
+				const touch = e.touches[0];
+				this.touchStartX = touch.clientX;
+				this.touchStartY = touch.clientY;
+				this.longPressTimer = setTimeout(() => {
+					this.touchDragActive = true;
+					this.touchDragType = "column";
+					this.draggedColumnKey = columnKey;
+					// Use containerEl.ownerDocument to support pop-out windows
+					this.containerEl.ownerDocument.addEventListener("contextmenu", this.boundContextMenuBlocker, true);
+					header.classList.add(draggingClass);
+					this.touchDragGhost = this.createTouchDragGhost(header, touch.clientX, touch.clientY);
+					navigator.vibrate?.(50);
+				}, this.LONG_PRESS_DELAY);
+			},
+			{ passive: true }
+		);
+
+		header.addEventListener(
+			"touchmove",
+			(e: TouchEvent) => {
+				if (e.touches.length !== 1) return;
+				const touch = e.touches[0];
+
+				if (!this.touchDragActive && this.longPressTimer) {
+					const dx = Math.abs(touch.clientX - this.touchStartX);
+					const dy = Math.abs(touch.clientY - this.touchStartY);
+					if (dx > this.TOUCH_MOVE_THRESHOLD || dy > this.TOUCH_MOVE_THRESHOLD) {
+						clearTimeout(this.longPressTimer);
+						this.longPressTimer = null;
+					}
+					return;
+				}
+
+				if (this.touchDragActive && this.touchDragType === "column") {
+					e.preventDefault();
+					this.updateTouchDragGhost(touch.clientX, touch.clientY);
+					this.updateDropTargetFeedback(touch.clientX, touch.clientY);
+					this.handleAutoScroll(touch.clientX);
+				}
+			},
+			{ passive: false }
+		);
+
+		header.addEventListener("touchend", async (e: TouchEvent) => {
+			if (this.longPressTimer) {
+				clearTimeout(this.longPressTimer);
+				this.longPressTimer = null;
+			}
+			header.classList.remove(draggingClass);
+
+			if (!this.touchDragActive || this.touchDragType !== "column") return;
+
+			const touch = e.changedTouches[0];
+			if (!touch) {
+				this.clearTouchDragState();
+				return;
+			}
+
+			const target = this.findDropTargetAt(touch.clientX, touch.clientY);
+			if (
+				target.type &&
+				target.groupKey &&
+				this.draggedColumnKey &&
+				target.groupKey !== this.draggedColumnKey
+			) {
+				const groupBy = this.getGroupByPropertyId();
+				if (groupBy) {
+					const selector = isSwimlaneHeader
+						? ".kanban-view__column-header-cell"
+						: ".kanban-view__column-header";
+					const currentOrder = Array.from(this.boardEl!.querySelectorAll(selector))
+						.map((el) => (el as HTMLElement).dataset.columnKey)
+						.filter(Boolean) as string[];
+
+					const dragIndex = currentOrder.indexOf(this.draggedColumnKey);
+					const dropIndex = currentOrder.indexOf(target.groupKey);
+
+					if (dragIndex !== -1 && dropIndex !== -1) {
+						const newOrder = [...currentOrder];
+						newOrder.splice(dragIndex, 1);
+						newOrder.splice(dropIndex, 0, this.draggedColumnKey);
+
+						await this.saveColumnOrder(groupBy, newOrder);
+						await this.render();
+					}
+				}
+			}
+
+			this.clearTouchDragState();
+		});
+
+		header.addEventListener("touchcancel", () => {
+			header.classList.remove(draggingClass);
+			this.clearTouchDragState();
+		});
+	}
+
+	private setupColumnDragDrop(
+		column: HTMLElement,
+		cardsContainer: HTMLElement,
+		groupKey: string
+	): void {
+		// Drag over handler
+		column.addEventListener("dragover", (e: DragEvent) => {
+			// Only handle task drags (not column drags)
+			if (e.dataTransfer?.types.includes("text/x-kanban-column")) return;
+			e.preventDefault();
+			e.stopPropagation();
+			if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
+			column.classList.add("kanban-view__column--dragover");
+		});
+
+		// Drag leave handler
+		column.addEventListener("dragleave", (e: DragEvent) => {
+			// Only remove if we're actually leaving the column (not just moving to a child)
+			const rect = column.getBoundingClientRect();
+			const x = (e as any).clientX;
+			const y = (e as any).clientY;
+
+			if (x < rect.left || x >= rect.right || y < rect.top || y >= rect.bottom) {
+				column.classList.remove("kanban-view__column--dragover");
+			}
+		});
+
+		// Drop handler
+		column.addEventListener("drop", async (e: DragEvent) => {
+			// Only handle task drags (not column drags)
+			if (e.dataTransfer?.types.includes("text/x-kanban-column")) return;
+			e.preventDefault();
+			e.stopPropagation();
+
+			this.debugLog("COLUMN-DROP-EVENT-RECEIVED", {
+				targetColumn: groupKey,
+				draggedTaskPath: this.draggedTaskPath?.split("/").pop() || "(null)",
+				dropTargetPath: this.dropTargetPath?.split("/").pop() || "(null)",
+				eventTarget: (e.target as HTMLElement)?.className?.slice(0, 60),
+			});
+
+			if (!this.draggedTaskPath) {
+				this.debugLog("COLUMN-DROP: bail — draggedTaskPath is null (dragend already fired?)");
+				column.classList.remove("kanban-view__column--dragover");
+				this.cleanupDragShift();
+				return;
+			}
+
+			// Capture drop position
+			let dropTarget = this.dropTargetPath
+				? { taskPath: this.dropTargetPath, above: this.dropAbove }
+				: undefined;
+
+			// For cross-column drops, the dropTarget may reference a card from
+			// the source column (stale from last dragover). Validate that the
+			// target card actually exists in the target column via DOM query.
+			const cardsContainer = column.querySelector(".kanban-view__cards") as HTMLElement | null;
+			const isCrossColumn = this.draggedFromColumn !== groupKey;
+			if (isCrossColumn && dropTarget) {
+				const targetInColumn = cardsContainer?.querySelector(`[data-task-path="${CSS.escape(dropTarget.taskPath)}"]`) != null;
+				if (!targetInColumn) {
+					// Drop target is stale (from source column). Clear it —
+					// handleTaskDrop will append to end of target column.
+					dropTarget = undefined;
+				}
+			}
+
+			// Same-column fallback: when dropTarget is null (e.g. user dropped
+			// in empty space below the last card where the card-level dragover
+			// never fired), reconstruct the drop target from the column's
+			// visible non-dragged cards.
+			if (!dropTarget && !isCrossColumn && cardsContainer) {
+				dropTarget = this.reconstructDropTarget(cardsContainer);
+			}
+
+			this.debugLog("COLUMN-DROP", {
+				draggedTask: this.draggedTaskPath?.split("/").pop(),
+				sourceColumn: this.draggedFromColumn,
+				targetColumn: groupKey,
+				isCrossColumn,
+				dropTarget: dropTarget ? { file: dropTarget.taskPath.split("/").pop(), above: dropTarget.above } : null,
+				cardsContainerFound: !!cardsContainer,
+				cardsContainerChildCount: cardsContainer?.childElementCount,
+				draggedTaskPaths: this.draggedTaskPaths.map(p => p.split("/").pop()),
+			});
+
+			// Optimistic DOM reorder: move card to correct position immediately
+			const paths = this.draggedTaskPaths.length > 0 ? this.draggedTaskPaths : [this.draggedTaskPath!];
+			const optimisticResult = this.performOptimisticReorder(paths, dropTarget, cardsContainer);
+			this.debugLog("COLUMN-DROP-OPTIMISTIC-RESULT", { success: optimisticResult });
+
+			// Now clean up shift CSS — no visual change since DOM is already correct
+			column.classList.remove("kanban-view__column--dragover");
+			this.cleanupDragShift();
+
+			// Update the task's groupBy property in Bases
+			await this.handleTaskDrop(this.draggedTaskPath, groupKey, null, dropTarget);
+
+			this.draggedTaskPath = null;
+			this.draggedFromColumn = null;
+		});
+
+		// Drag end handler - cleanup in case drop doesn't fire
+		column.addEventListener("dragend", () => {
+			column.classList.remove("kanban-view__column--dragover");
+		});
+	}
+
+	private setupSwimLaneCellDragDrop(
+		cell: HTMLElement,
+		columnKey: string,
+		swimLaneKey: string
+	): void {
+		// Drag over handler
+		cell.addEventListener("dragover", (e: DragEvent) => {
+			e.preventDefault();
+			e.stopPropagation();
+			if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
+			cell.classList.add("kanban-view__swimlane-column--dragover");
+		});
+
+		// Drag leave handler
+		cell.addEventListener("dragleave", (e: DragEvent) => {
+			// Only remove if we're actually leaving the cell (not just moving to a child)
+			const rect = cell.getBoundingClientRect();
+			const x = (e as any).clientX;
+			const y = (e as any).clientY;
+
+			if (x < rect.left || x >= rect.right || y < rect.top || y >= rect.bottom) {
+				cell.classList.remove("kanban-view__swimlane-column--dragover");
+			}
+		});
+
+		// Drop handler
+		cell.addEventListener("drop", async (e: DragEvent) => {
+			e.preventDefault();
+			e.stopPropagation();
+
+			this.debugLog("SWIMLANE-CELL-DROP-EVENT-RECEIVED", {
+				targetColumn: columnKey,
+				targetSwimlane: swimLaneKey,
+				draggedTaskPath: this.draggedTaskPath?.split("/").pop() || "(null)",
+				dropTargetPath: this.dropTargetPath?.split("/").pop() || "(null)",
+				eventTarget: (e.target as HTMLElement)?.className?.slice(0, 60),
+			});
+
+			if (!this.draggedTaskPath) {
+				this.debugLog("SWIMLANE-CELL-DROP: bail — draggedTaskPath is null (dragend already fired?)");
+				cell.classList.remove("kanban-view__swimlane-column--dragover");
+				this.cleanupDragShift();
+				return;
+			}
+
+			// Capture drop position
+			let dropTarget = this.dropTargetPath
+				? { taskPath: this.dropTargetPath, above: this.dropAbove }
+				: undefined;
+
+			// For cross-column/swimlane drops, validate dropTarget is in this cell via DOM query
+			const cardsContainer = cell.querySelector(".kanban-view__tasks-container") as HTMLElement | null;
+			const isCrossColumn = this.draggedFromColumn !== columnKey;
+			const isCrossSwimlane = this.draggedFromSwimlane !== swimLaneKey;
+			if ((isCrossColumn || isCrossSwimlane) && dropTarget) {
+				const targetInCell = cardsContainer?.querySelector(`[data-task-path="${CSS.escape(dropTarget.taskPath)}"]`) != null;
+				if (!targetInCell) {
+					dropTarget = undefined;
+				}
+			}
+
+			// Same-cell fallback: when dropTarget is null (e.g. user dropped
+			// in empty space below the last card), reconstruct the drop target
+			// from the cell's visible non-dragged cards.
+			if (!dropTarget && !isCrossColumn && !isCrossSwimlane && cardsContainer) {
+				dropTarget = this.reconstructDropTarget(cardsContainer);
+			}
+
+			// Optimistic DOM reorder: move card to correct position immediately
+			const paths = this.draggedTaskPaths.length > 0 ? this.draggedTaskPaths : [this.draggedTaskPath!];
+			this.debugLog("SWIMLANE-CELL-DROP", {
+				draggedTask: this.draggedTaskPath?.split("/").pop(),
+				isCrossColumn,
+				isCrossSwimlane,
+				dropTarget: dropTarget ? { file: dropTarget.taskPath.split("/").pop(), above: dropTarget.above } : null,
+				cardsContainerFound: !!cardsContainer,
+				cardsContainerChildCount: cardsContainer?.childElementCount,
+			});
+			const optimisticResult = this.performOptimisticReorder(paths, dropTarget, cardsContainer);
+			this.debugLog("SWIMLANE-CELL-DROP-OPTIMISTIC-RESULT", { success: optimisticResult });
+
+			// Now clean up shift CSS — no visual change since DOM is already correct
+			cell.classList.remove("kanban-view__swimlane-column--dragover");
+			this.cleanupDragShift();
+
+			// Update both the groupBy property and swimlane property
+			await this.handleTaskDrop(this.draggedTaskPath, columnKey, swimLaneKey, dropTarget);
+
+			this.draggedTaskPath = null;
+			this.draggedFromColumn = null;
+		});
+
+		// Drag end handler - cleanup in case drop doesn't fire
+		cell.addEventListener("dragend", () => {
+			cell.classList.remove("kanban-view__swimlane-column--dragover");
+		});
+	}
+
+	private createTouchDragGhost(sourceEl: HTMLElement, x: number, y: number): HTMLElement {
+		const ghost = sourceEl.cloneNode(true) as HTMLElement;
+		ghost.classList.add("kanban-view__touch-ghost");
+		ghost.style.cssText = `
+			position: fixed;
+			left: ${x}px;
+			top: ${y}px;
+			width: ${sourceEl.offsetWidth}px;
+			pointer-events: none;
+			z-index: 10000;
+			opacity: 0.8;
+			transform: translate(-50%, -50%) rotate(3deg);
+			box-shadow: 0 8px 24px rgba(0,0,0,0.3);
+		`;
+		// Use containerEl.ownerDocument to support pop-out windows
+		const doc = this.containerEl.ownerDocument;
+		doc.body.appendChild(ghost);
+		return ghost;
+	}
+
+	private updateTouchDragGhost(x: number, y: number): void {
+		if (this.touchDragGhost) {
+			this.touchDragGhost.style.left = `${x}px`;
+			this.touchDragGhost.style.top = `${y}px`;
+		}
+	}
+
+	private removeTouchDragGhost(): void {
+		if (this.touchDragGhost) {
+			this.touchDragGhost.remove();
+			this.touchDragGhost = null;
+		}
+	}
+
+	private findDropTargetAt(x: number, y: number): {
+		type: "column" | "swimlane" | "columnHeader" | null;
+		groupKey: string | null;
+		swimLaneKey: string | null;
+		element: HTMLElement | null;
+	} {
+		if (this.touchDragGhost) this.touchDragGhost.style.display = "none";
+		// Use containerEl.ownerDocument to support pop-out windows
+		const doc = this.containerEl.ownerDocument;
+		const el = doc.elementFromPoint(x, y) as HTMLElement | null;
+		if (this.touchDragGhost) this.touchDragGhost.style.display = "";
+
+		if (!el) return { type: null, groupKey: null, swimLaneKey: null, element: null };
+
+		const swimCell = el.closest("[data-column][data-swimlane]") as HTMLElement;
+		if (swimCell) {
+			return {
+				type: "swimlane",
+				groupKey: swimCell.dataset.column || null,
+				swimLaneKey: swimCell.dataset.swimlane || null,
+				element: swimCell,
+			};
+		}
+
+		const column = el.closest("[data-group]") as HTMLElement;
+		if (column) {
+			return {
+				type: "column",
+				groupKey: column.dataset.group || null,
+				swimLaneKey: null,
+				element: column,
+			};
+		}
+
+		const header = el.closest("[data-column-key]") as HTMLElement;
+		if (header) {
+			return {
+				type: "columnHeader",
+				groupKey: header.dataset.columnKey || null,
+				swimLaneKey: null,
+				element: header,
+			};
+		}
+
+		return { type: null, groupKey: null, swimLaneKey: null, element: null };
+	}
+
+	private clearDragoverFeedback(): void {
+		this.boardEl?.querySelectorAll(".kanban-view__column--dragover").forEach((el) => {
+			el.classList.remove("kanban-view__column--dragover");
+		});
+		this.boardEl?.querySelectorAll(".kanban-view__swimlane-column--dragover").forEach((el) => {
+			el.classList.remove("kanban-view__swimlane-column--dragover");
+		});
+		this.boardEl?.querySelectorAll(".kanban-view__column-header--dragover").forEach((el) => {
+			el.classList.remove("kanban-view__column-header--dragover");
+		});
+		this.boardEl?.querySelectorAll(".kanban-view__column-header-cell--dragover").forEach((el) => {
+			el.classList.remove("kanban-view__column-header-cell--dragover");
+		});
+	}
+
+	private updateDropTargetFeedback(x: number, y: number): void {
+		this.clearDragoverFeedback();
+		const target = this.findDropTargetAt(x, y);
+		if (target.element) {
+			if (target.type === "column") {
+				target.element.classList.add("kanban-view__column--dragover");
+			} else if (target.type === "swimlane") {
+				target.element.classList.add("kanban-view__swimlane-column--dragover");
+			} else if (target.type === "columnHeader" && this.touchDragType === "column") {
+				if (target.element.classList.contains("kanban-view__column-header-cell")) {
+					target.element.classList.add("kanban-view__column-header-cell--dragover");
+				} else {
+					target.element.classList.add("kanban-view__column-header--dragover");
+				}
+			}
+		}
+	}
+
+	private clearTouchDragState(): void {
+		this.touchDragActive = false;
+		// Use containerEl.ownerDocument to support pop-out windows
+		this.containerEl.ownerDocument.removeEventListener("contextmenu", this.boundContextMenuBlocker, true);
+		this.removeTouchDragGhost();
+		this.stopAutoScroll();
+
+		if (this.longPressTimer) {
+			clearTimeout(this.longPressTimer);
+			this.longPressTimer = null;
+		}
+
+		this.clearDragoverFeedback();
+
+		for (const path of this.draggedTaskPaths) {
+			this.currentTaskElements.get(path)?.classList.remove("kanban-view__card--dragging");
+		}
+
+		this.draggedTaskPath = null;
+		this.draggedTaskPaths = [];
+		this.draggedFromColumn = null;
+		this.draggedFromSwimlane = null;
+		this.draggedSourceColumns.clear();
+		this.draggedSourceSwimlanes.clear();
+		this.touchDragType = null;
+		this.draggedColumnKey = null;
+	}
+
+	private handleAutoScroll(touchX: number): void {
+		if (!this.boardEl) return;
+
+		const rect = this.boardEl.getBoundingClientRect();
+		const leftEdge = rect.left + this.AUTO_SCROLL_EDGE;
+		const rightEdge = rect.right - this.AUTO_SCROLL_EDGE;
+
+		let newDirection = 0;
+		if (touchX < leftEdge) newDirection = -1;
+		else if (touchX > rightEdge) newDirection = 1;
+
+		if (newDirection !== this.autoScrollDirection) {
+			this.stopAutoScroll();
+			this.autoScrollDirection = newDirection;
+			if (newDirection !== 0) {
+				this.autoScrollTimer = setInterval(() => {
+					if (this.boardEl) {
+						this.boardEl.scrollLeft += this.autoScrollDirection * this.AUTO_SCROLL_SPEED;
+					}
+				}, 16);
+			}
+		}
+	}
+
+	private stopAutoScroll(): void {
+		if (this.autoScrollTimer) {
+			clearInterval(this.autoScrollTimer);
+			this.autoScrollTimer = null;
+		}
+		this.autoScrollDirection = 0;
+	}
+
+	private setupCardDragHandlers(cardWrapper: HTMLElement, task: TaskInfo): void {
+		// Handle click for selection mode
+		cardWrapper.addEventListener("click", (e: MouseEvent) => {
+			// Check if this is a selection click
+			if (this.handleSelectionClick(e, task.path)) {
+				e.stopPropagation();
+				return;
+			}
+		});
+
+		// Handle right-click for context menu (skip if touch drag pending/active)
+		cardWrapper.addEventListener("contextmenu", (e: MouseEvent) => {
+			e.preventDefault();
+			e.stopPropagation();
+
+			if (this.longPressTimer || this.touchDragActive) return;
+
+			const selectionService = this.plugin.taskSelectionService;
+			if (selectionService && selectionService.getSelectionCount() > 1) {
+				// Ensure the right-clicked task is in the selection
+				if (!selectionService.isSelected(task.path)) {
+					selectionService.addToSelection(task.path);
+				}
+				this.showBatchContextMenu(e);
+				return;
+			}
+
+			// Show single task context menu
+			const { showTaskContextMenu } = require("../ui/TaskCard");
+			showTaskContextMenu(e, task.path, this.plugin, new Date());
+		});
+
+		cardWrapper.addEventListener("dragover", (e: DragEvent) => {
+			// Skip if dragging over self
+			if (this.draggedTaskPath === task.path) return;
+			// Must call preventDefault synchronously to keep the drop zone active
+			e.preventDefault();
+			e.stopPropagation();
+			if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
+
+			// Throttle the visual update via rAF
+			const clientY = e.clientY;
+			if (!this.dragOverRafId) {
+				this.dragOverRafId = requestAnimationFrame(() => {
+					this.dragOverRafId = 0;
+
+					const rect = cardWrapper.getBoundingClientRect();
+					const isAbove = clientY < rect.top + rect.height / 2;
+
+					this.dropTargetPath = task.path;
+					this.dropAbove = isAbove;
+
+					// Determine the container for this card
+					const container = cardWrapper.parentElement;
+					if (!container) return;
+
+					// If the drag moved to a different container (cross-column),
+					// clean up old container and set up the new one
+					if (container !== this.dragContainer) {
+						this.cleanupDragShift();
+
+						// Measure the primary dragged card for gap sizing
+						const primaryWrapper = this.currentTaskElements.get(this.draggedTaskPath || "");
+						const draggedHeight = primaryWrapper
+							? primaryWrapper.getBoundingClientRect().height || 60
+							: 60;
+						const gapStr = getComputedStyle(container).gap;
+						const gap = parseFloat(gapStr) || 4;
+						const totalGap = draggedHeight + gap;
+						container.style.setProperty("--tn-drag-gap", `${totalGap}px`);
+						container.style.overflowY = "clip";
+						// Padding grows the container's content box so
+						// translateY-shifted cards have real layout space.
+						// Also bump the column's max-height so it can grow
+						// to accommodate the taller container.
+						container.style.paddingBottom = `${totalGap}px`;
+						const parentCol = container.closest<HTMLElement>(
+							".kanban-view__column, .kanban-view__swimlane-column"
+						);
+						if (parentCol) {
+							const currentHeight = parentCol.getBoundingClientRect().height;
+							parentCol.style.maxHeight = `${currentHeight + totalGap}px`;
+							this.dragTargetColumnEl = parentCol;
+						}
+
+						const siblings = container.querySelectorAll<HTMLElement>(".kanban-view__card-wrapper");
+						for (const sib of siblings) {
+							if (!this.draggedTaskPaths.includes(sib.dataset.taskPath || "")) {
+								sib.classList.add("kanban-view__card-wrapper--drag-shift");
+							}
+						}
+						this.dragContainer = container;
+					}
+
+					// Compute insertion index among non-dragged siblings
+					const siblings = Array.from(
+						container.querySelectorAll<HTMLElement>(".kanban-view__card-wrapper")
+					).filter(sib => !this.draggedTaskPaths.includes(sib.dataset.taskPath || ""));
+
+					let insertionIndex = siblings.length; // default: end
+					for (let i = 0; i < siblings.length; i++) {
+						if (siblings[i].dataset.taskPath === task.path) {
+							insertionIndex = isAbove ? i : i + 1;
+							break;
+						}
+					}
+
+					if (insertionIndex !== this.currentInsertionIndex) {
+						this.currentInsertionIndex = insertionIndex;
+						for (let i = 0; i < siblings.length; i++) {
+							siblings[i].classList.toggle(
+								"kanban-view__card-wrapper--shift-down",
+								i >= insertionIndex
+							);
+						}
+					}
+				});
+			}
+		});
+
+		// dragleave: don't clear shifts — dragover on the container keeps them current
+		cardWrapper.addEventListener("dragleave", () => {
+			// No-op: shift state is managed by dragover
+		});
+
+		// Drop handler on card — handles drop at card level so it doesn't
+		// depend on event bubbling to the column (which can fail if the column
+		// is re-rendered during the drag)
+		cardWrapper.addEventListener("drop", async (e: DragEvent) => {
+			// Only handle task drags (not column drags)
+			if (e.dataTransfer?.types.includes("text/x-kanban-column")) return;
+			e.preventDefault();
+			e.stopPropagation();
+
+			if (!this.draggedTaskPath) {
+				return;
+			}
+
+			// Determine which column this card belongs to
+			const col = cardWrapper.closest("[data-group]") as HTMLElement;
+			const swimCol = cardWrapper.closest("[data-column]") as HTMLElement;
+			const swimlaneRow = cardWrapper.closest("[data-swimlane]") as HTMLElement;
+			const groupKey = col?.dataset.group || swimCol?.dataset.column;
+			const swimLaneKey = swimlaneRow?.dataset.swimlane || null;
+
+			if (!groupKey) return;
+
+			// Build drop target from the current card position
+			const dropTarget = {
+				taskPath: task.path,
+				above: this.dropAbove
+			};
+
+			const container = cardWrapper.parentElement;
+
+			this.debugLog("CARD-DROP (drop-on-card handler)", {
+				draggedTask: this.draggedTaskPath?.split("/").pop(),
+				targetCard: task.path.split("/").pop(),
+				sourceColumn: this.draggedFromColumn,
+				targetColumn: groupKey,
+				isCrossColumn: this.draggedFromColumn !== groupKey,
+				above: this.dropAbove,
+				swimLaneKey,
+			});
+
+			// Optimistic DOM reorder: move card to correct position immediately
+			const paths = this.draggedTaskPaths.length > 0 ? this.draggedTaskPaths : [this.draggedTaskPath!];
+			this.performOptimisticReorder(paths, dropTarget);
+
+			// Now clean up shift CSS — no visual change since DOM is already correct
+			this.cleanupDragShift();
+			col?.classList.remove("kanban-view__column--dragover");
+
+			await this.handleTaskDrop(this.draggedTaskPath, groupKey, swimLaneKey, dropTarget);
+
+			this.draggedTaskPath = null;
+			this.draggedFromColumn = null;
+		});
+
+		cardWrapper.addEventListener("dragstart", (e: DragEvent) => {
+			this.debugLog("DRAGSTART", {
+				task: task.path.split("/").pop(),
+				inCurrentTaskElements: this.currentTaskElements.has(task.path),
+			});
+			// Check if we're dragging selected tasks (batch drag)
+			const selectionService = this.plugin.taskSelectionService;
+			if (
+				selectionService &&
+				selectionService.isSelected(task.path) &&
+				selectionService.getSelectionCount() > 1
+			) {
+				// Batch drag - drag all selected tasks
+				this.draggedTaskPaths = selectionService.getSelectedPaths();
+				this.draggedTaskPath = task.path;
+
+				// Build source column and swimlane maps for all selected tasks
+				this.draggedSourceColumns.clear();
+				this.draggedSourceSwimlanes.clear();
+				for (const path of this.draggedTaskPaths) {
+					const wrapper = this.currentTaskElements.get(path);
+					if (wrapper) {
+						wrapper.classList.add("kanban-view__card--dragging");
+						// Capture source column for each task
+						const col = wrapper.closest("[data-group]") as HTMLElement;
+						const swimCol = wrapper.closest("[data-column]") as HTMLElement;
+						const swimlaneRow = wrapper.closest("[data-swimlane]") as HTMLElement;
+						const sourceCol = col?.dataset.group || swimCol?.dataset.column;
+						const sourceSwimlane = swimlaneRow?.dataset.swimlane;
+						if (sourceCol) {
+							this.draggedSourceColumns.set(path, sourceCol);
+						}
+						if (sourceSwimlane) {
+							this.draggedSourceSwimlanes.set(path, sourceSwimlane);
+						}
+					}
+				}
+
+				if (e.dataTransfer) {
+					e.dataTransfer.effectAllowed = "move";
+					e.dataTransfer.setData("text/plain", this.draggedTaskPaths.join(","));
+					e.dataTransfer.setData("text/x-batch-drag", "true");
+				}
+			} else {
+				// Single card drag
+				this.draggedTaskPath = task.path;
+				this.draggedTaskPaths = [task.path];
+				cardWrapper.classList.add("kanban-view__card--dragging");
+
+				if (e.dataTransfer) {
+					e.dataTransfer.effectAllowed = "move";
+					e.dataTransfer.setData("text/plain", task.path);
+				}
+			}
+
+			// Capture the source column and swimlane for list property handling (single drag fallback)
+			const column = cardWrapper.closest("[data-group]") as HTMLElement;
+			const swimlaneColumn = cardWrapper.closest("[data-column]") as HTMLElement;
+			const swimlaneRow = cardWrapper.closest("[data-swimlane]") as HTMLElement;
+			this.draggedFromColumn =
+				column?.dataset.group || swimlaneColumn?.dataset.column || null;
+			this.draggedFromSwimlane = swimlaneRow?.dataset.swimlane || null;
+
+			// Add body-level class to suppress hover lift on siblings
+			this.containerEl.ownerDocument.body.classList.add("tn-drag-active");
+
+			// Measure card height before collapse (for gap/slot sizing)
+			const draggedHeight = cardWrapper.getBoundingClientRect().height;
+			const container = cardWrapper.parentElement;
+
+			// Lock the source column's height so it doesn't shrink when the
+			// dragged card collapses.  Works for both regular columns and
+			// swimlane cells.
+			const sourceCol = cardWrapper.closest<HTMLElement>(
+				".kanban-view__column, .kanban-view__swimlane-column"
+			);
+			if (sourceCol) {
+				sourceCol.style.minHeight = `${sourceCol.offsetHeight}px`;
+				this.dragSourceColumnEl = sourceCol;
+			}
+
+			// Collapse dragged cards on next frame (after browser captures drag image)
+			requestAnimationFrame(() => {
+				for (const path of this.draggedTaskPaths) {
+					const wrapper = this.currentTaskElements.get(path);
+					if (wrapper) {
+						wrapper.style.height = "0";
+						wrapper.style.overflow = "hidden";
+						wrapper.style.padding = "0";
+						wrapper.style.margin = "0";
+						wrapper.style.border = "none";
+						wrapper.style.opacity = "0";
+					}
+				}
+
+				// Set up gap/slot on siblings in the source container
+				if (container) {
+					const gapStr = getComputedStyle(container).gap;
+					const gap = parseFloat(gapStr) || 4;
+					container.style.setProperty("--tn-drag-gap", `${draggedHeight + gap}px`);
+					// Clip overflow so translateY shifts don't cause scrollbars
+					container.style.overflowY = "clip";
+
+					const siblings = container.querySelectorAll<HTMLElement>(".kanban-view__card-wrapper");
+					for (const sib of siblings) {
+						if (!this.draggedTaskPaths.includes(sib.dataset.taskPath || "")) {
+							sib.classList.add("kanban-view__card-wrapper--drag-shift");
+						}
+					}
+					this.dragContainer = container;
+					this.currentInsertionIndex = -1;
+				}
+			});
+		});
+
+		cardWrapper.addEventListener("dragend", () => {
+			this.debugLog("DRAGEND-FIRED", {
+				draggedTask: task.path.split("/").pop(),
+				draggedTaskPath: this.draggedTaskPath?.split("/").pop() || "(already null)",
+				draggedTaskPathsCount: this.draggedTaskPaths.length,
+				pendingRender: this.pendingRender,
+				activeDropCount: this.activeDropCount,
+				suppressRenderRemaining: Math.max(0, this.suppressRenderUntil - Date.now()),
+			});
+
+			// Restore collapsed dragged cards' inline styles
+			for (const path of this.draggedTaskPaths) {
+				const wrapper = this.currentTaskElements.get(path);
+				if (wrapper) {
+					const parentClass = wrapper.parentElement?.className || "(detached)";
+					this.debugLog("DRAGEND-RESTORE-CARD", {
+						path: path.split("/").pop(),
+						parentClass,
+						currentStyles: wrapper.style.cssText.slice(0, 80),
+					});
+					wrapper.style.cssText = "";
+					wrapper.classList.remove("kanban-view__card--dragging");
+				}
+			}
+			cardWrapper.style.cssText = "";
+			cardWrapper.classList.remove("kanban-view__card--dragging");
+
+			// Clean up gap/slot state and unlock source column height
+			this.cleanupDragShift();
+			if (this.dragSourceColumnEl) {
+				this.dragSourceColumnEl.style.minHeight = "";
+				this.dragSourceColumnEl = null;
+			}
+			this.containerEl.ownerDocument.body.classList.remove("tn-drag-active");
+
+			// Clear drag state. The drop handler snapshots dropTargetPath and
+			// clears it before its first await, so this is safe even if
+			// handleTaskDrop is still running.
+			this.draggedTaskPath = null;
+			this.draggedFromColumn = null;
+			this.draggedFromSwimlane = null;
+			this.draggedTaskPaths = [];
+			this.draggedSourceColumns.clear();
+			this.draggedSourceSwimlanes.clear();
+
+			// Clean up any lingering dragover classes
+			this.boardEl?.querySelectorAll(".kanban-view__column--dragover").forEach((el) => {
+				el.classList.remove("kanban-view__column--dragover");
+			});
+			this.boardEl
+				?.querySelectorAll(".kanban-view__swimlane-column--dragover")
+				.forEach((el) => {
+					el.classList.remove("kanban-view__swimlane-column--dragover");
+				});
+
+			this.dropTargetPath = null;
+
+			// Cancel any pending rAF
+			if (this.dragOverRafId) {
+				cancelAnimationFrame(this.dragOverRafId);
+				this.dragOverRafId = 0;
+			}
+
+			// Flush any render that was deferred while dragging.
+			// Use a short delay so the async drop handler can finish first.
+			if (this.pendingRender) {
+				this.debugLog("DRAGEND-PENDING-RENDER: flushing deferred render via debouncedRefresh");
+				this.pendingRender = false;
+				this.debouncedRefresh();
+			} else {
+				this.debugLog("DRAGEND: no pending render to flush");
+			}
+		});
+
+		this.setupCardTouchHandlers(cardWrapper, task);
+	}
+
+	/**
+	 * Reconstruct a drop target from the visible (non-dragged) cards in a container.
+	 * Used as a fallback when the user drops in empty space where the card-level
+	 * dragover never fired, so dropTargetPath is null.
+	 */
+	private reconstructDropTarget(
+		cardsContainer: HTMLElement
+	): { taskPath: string; above: boolean } | undefined {
+		const visibleCards = Array.from(
+			cardsContainer.querySelectorAll<HTMLElement>(".kanban-view__card-wrapper")
+		).filter(el => !this.draggedTaskPaths.includes(el.dataset.taskPath || ""));
+
+		if (visibleCards.length === 0) return undefined;
+
+		// Use currentInsertionIndex if available; otherwise
+		// default to after the last visible card.
+		const idx = this.currentInsertionIndex >= 0
+			? Math.min(this.currentInsertionIndex, visibleCards.length)
+			: visibleCards.length;
+
+		if (idx === 0) {
+			// Before the first visible card
+			return { taskPath: visibleCards[0].dataset.taskPath!, above: true };
+		}
+		// After the card at idx-1
+		return { taskPath: visibleCards[idx - 1].dataset.taskPath!, above: false };
+	}
+
+	/**
+	 * Move dragged card(s) to the correct DOM position immediately after drop,
+	 * before CSS shift classes are removed. This prevents the visual flash
+	 * where cards snap to their original position before the re-render.
+	 * Returns false if optimistic reorder could not be performed (e.g. virtual-scrolled column).
+	 */
+	private performOptimisticReorder(
+		draggedPaths: string[],
+		dropTarget: { taskPath: string; above: boolean } | undefined,
+		targetContainer?: HTMLElement | null
+	): boolean {
+		if (draggedPaths.length === 0) {
+			this.debugLog("OPTIMISTIC-REORDER: bail — no dragged paths");
+			return false;
+		}
+
+		// Cross-column drop onto empty space / column background: no specific
+		// card target, but we know the destination container.  Append the
+		// dragged card(s) so the user sees an instant move instead of the card
+		// snapping back to the source column.
+		if (!dropTarget) {
+			if (!targetContainer) {
+				this.debugLog("OPTIMISTIC-REORDER: bail — no dropTarget AND no targetContainer");
+				return false;
+			}
+			this.debugLog("OPTIMISTIC-REORDER: cross-column append path", {
+				paths: draggedPaths.map(p => p.split("/").pop()),
+				containerChildCount: targetContainer.childElementCount,
+				containerClass: targetContainer.className,
+			});
+			for (const path of draggedPaths) {
+				const draggedEl = this.currentTaskElements.get(path);
+				if (!draggedEl) {
+					this.debugLog("OPTIMISTIC-REORDER: bail — element not in currentTaskElements", { path: path.split("/").pop() });
+					return false;
+				}
+				const oldParent = draggedEl.parentElement;
+				this.debugLog("OPTIMISTIC-REORDER: moving element", {
+					path: path.split("/").pop(),
+					oldParentClass: oldParent?.className,
+					oldParentChildCount: oldParent?.childElementCount,
+					sameContainer: oldParent === targetContainer,
+					elCurrentStyles: draggedEl.style.cssText.slice(0, 120),
+				});
+				draggedEl.style.cssText = "";
+				draggedEl.classList.remove("kanban-view__card--dragging");
+				targetContainer.appendChild(draggedEl);
+			}
+			this.debugLog("OPTIMISTIC-REORDER: cross-column append SUCCESS", {
+				containerChildCount: targetContainer.childElementCount,
+			});
+			return true;
+		}
+
+		this.debugLog("OPTIMISTIC-REORDER: drop-on-card path", {
+			paths: draggedPaths.map(p => p.split("/").pop()),
+			targetCard: dropTarget.taskPath.split("/").pop(),
+			above: dropTarget.above,
+			hasContainer: !!targetContainer,
+		});
+
+		const targetEl = this.currentTaskElements.get(dropTarget.taskPath);
+		if (!targetEl) {
+			this.debugLog("OPTIMISTIC-REORDER: bail — target element not in currentTaskElements", { target: dropTarget.taskPath.split("/").pop() });
+			return false;
+		}
+
+		const container = targetContainer || targetEl.parentElement;
+		if (!container) {
+			this.debugLog("OPTIMISTIC-REORDER: bail — no container resolved");
+			return false;
+		}
+
+		// If the target element is not in the container (e.g. cross-column drop
+		// where dropTarget references a card in the source column), bail out
+		// gracefully — the post-drop render will fix the DOM.
+		if (!container.contains(targetEl)) {
+			this.debugLog("OPTIMISTIC-REORDER: bail — targetEl not in container", {
+				containerClass: container.className,
+				targetElParentClass: targetEl.parentElement?.className,
+			});
+			return false;
+		}
+
+		for (const path of draggedPaths) {
+			const draggedEl = this.currentTaskElements.get(path);
+			if (!draggedEl) {
+				this.debugLog("OPTIMISTIC-REORDER: bail — dragged element not in map (virtual scroll?)", { path: path.split("/").pop() });
+				return false; // Virtual-scrolled column — can't do optimistic reorder
+			}
+
+			// Restore visibility (undo the dragstart collapse)
+			draggedEl.style.cssText = "";
+			draggedEl.classList.remove("kanban-view__card--dragging");
+
+			// Move to correct DOM position
+			if (dropTarget.above) {
+				container.insertBefore(draggedEl, targetEl);
+			} else {
+				container.insertBefore(draggedEl, targetEl.nextSibling);
+			}
+		}
+		this.debugLog("OPTIMISTIC-REORDER: drop-on-card SUCCESS");
+		return true;
+	}
+
+	/**
+	 * Extract the current visual task order from a cards container's DOM children.
+	 * Returns TaskInfo[] in display order with fresh sort_order values from metadataCache.
+	 */
+	
+
+	/**
+	 * Remove all gap/slot shift classes and custom properties from the current
+	 * drag container (and any stale containers from cross-column drags).
+	 */
+	private cleanupDragShift(): void {
+		// Clean current container
+		if (this.dragContainer) {
+			this.dragContainer.style.removeProperty("--tn-drag-gap");
+			this.dragContainer.style.overflowY = "";
+			this.dragContainer.style.paddingBottom = "";
+			const wrappers = this.dragContainer.querySelectorAll<HTMLElement>(
+				".kanban-view__card-wrapper--drag-shift, .kanban-view__card-wrapper--shift-down"
+			);
+			for (const w of wrappers) {
+				w.classList.remove("kanban-view__card-wrapper--drag-shift", "kanban-view__card-wrapper--shift-down");
+			}
+			this.dragContainer = null;
+		}
+
+		// Reset target column max-height
+		if (this.dragTargetColumnEl) {
+			this.dragTargetColumnEl.style.maxHeight = "";
+			this.dragTargetColumnEl = null;
+		}
+
+		// Also clean any wrappers on the entire board (safety net for cross-column)
+		this.boardEl?.querySelectorAll<HTMLElement>(
+			".kanban-view__card-wrapper--drag-shift, .kanban-view__card-wrapper--shift-down"
+		).forEach(w => {
+			w.classList.remove("kanban-view__card-wrapper--drag-shift", "kanban-view__card-wrapper--shift-down");
+		});
+
+		this.currentInsertionIndex = -1;
+	}
+
+	private setupCardTouchHandlers(cardWrapper: HTMLElement, task: TaskInfo): void {
+		if (!Platform.isMobile) return;
+
+		cardWrapper.addEventListener(
+			"touchstart",
+			(e: TouchEvent) => {
+				if (e.touches.length !== 1) return;
+				const touch = e.touches[0];
+				this.touchStartX = touch.clientX;
+				this.touchStartY = touch.clientY;
+				this.longPressTimer = setTimeout(() => {
+					this.initiateTouchDrag(cardWrapper, task, touch.clientX, touch.clientY);
+				}, this.LONG_PRESS_DELAY);
+			},
+			{ passive: true }
+		);
+
+		cardWrapper.addEventListener(
+			"touchmove",
+			(e: TouchEvent) => {
+				if (e.touches.length !== 1) return;
+				const touch = e.touches[0];
+
+				if (!this.touchDragActive && this.longPressTimer) {
+					const dx = Math.abs(touch.clientX - this.touchStartX);
+					const dy = Math.abs(touch.clientY - this.touchStartY);
+					if (dx > this.TOUCH_MOVE_THRESHOLD || dy > this.TOUCH_MOVE_THRESHOLD) {
+						clearTimeout(this.longPressTimer);
+						this.longPressTimer = null;
+					}
+					return;
+				}
+
+				if (this.touchDragActive && this.touchDragType === "task") {
+					e.preventDefault();
+					this.updateTouchDragGhost(touch.clientX, touch.clientY);
+					this.updateDropTargetFeedback(touch.clientX, touch.clientY);
+					this.handleAutoScroll(touch.clientX);
+				}
+			},
+			{ passive: false }
+		);
+
+		cardWrapper.addEventListener("touchend", async (e: TouchEvent) => {
+			if (this.longPressTimer) {
+				clearTimeout(this.longPressTimer);
+				this.longPressTimer = null;
+			}
+
+			if (!this.touchDragActive || this.touchDragType !== "task") return;
+
+			const touch = e.changedTouches[0];
+			if (!touch) {
+				this.clearTouchDragState();
+				return;
+			}
+
+			const target = this.findDropTargetAt(touch.clientX, touch.clientY);
+			if (target.groupKey && this.draggedTaskPath) {
+				for (const path of this.draggedTaskPaths) {
+					await this.handleTaskDrop(path, target.groupKey, target.swimLaneKey);
+				}
+			}
+
+			this.clearTouchDragState();
+		});
+
+		cardWrapper.addEventListener("touchcancel", () => {
+			this.clearTouchDragState();
+		});
+	}
+
+	private initiateTouchDrag(cardWrapper: HTMLElement, task: TaskInfo, x: number, y: number): void {
+		this.touchDragActive = true;
+		this.touchDragType = "task";
+		// Use containerEl.ownerDocument to support pop-out windows
+		this.containerEl.ownerDocument.addEventListener("contextmenu", this.boundContextMenuBlocker, true);
+
+		const selectionService = this.plugin.taskSelectionService;
+		if (selectionService?.isSelected(task.path) && selectionService.getSelectionCount() > 1) {
+			this.draggedTaskPaths = selectionService.getSelectedPaths();
+			this.draggedTaskPath = task.path;
+			this.draggedSourceColumns.clear();
+			this.draggedSourceSwimlanes.clear();
+			for (const path of this.draggedTaskPaths) {
+				const wrapper = this.currentTaskElements.get(path);
+				if (wrapper) {
+					wrapper.classList.add("kanban-view__card--dragging");
+					const col = wrapper.closest("[data-group]") as HTMLElement;
+					const swimCol = wrapper.closest("[data-column]") as HTMLElement;
+					const swimlaneRow = wrapper.closest("[data-swimlane]") as HTMLElement;
+					const sourceCol = col?.dataset.group || swimCol?.dataset.column;
+					const sourceSwimlane = swimlaneRow?.dataset.swimlane;
+					if (sourceCol) this.draggedSourceColumns.set(path, sourceCol);
+					if (sourceSwimlane) this.draggedSourceSwimlanes.set(path, sourceSwimlane);
+				}
+			}
+		} else {
+			this.draggedTaskPath = task.path;
+			this.draggedTaskPaths = [task.path];
+			cardWrapper.classList.add("kanban-view__card--dragging");
+		}
+
+		const column = cardWrapper.closest("[data-group]") as HTMLElement;
+		const swimlaneColumn = cardWrapper.closest("[data-column]") as HTMLElement;
+		const swimlaneRow = cardWrapper.closest("[data-swimlane]") as HTMLElement;
+		this.draggedFromColumn = column?.dataset.group || swimlaneColumn?.dataset.column || null;
+		this.draggedFromSwimlane = swimlaneRow?.dataset.swimlane || null;
+
+		this.touchDragGhost = this.createTouchDragGhost(cardWrapper, x, y);
+		navigator.vibrate?.(50);
+	}
+
+	private async handleTaskDrop(
+		taskPath: string,
+		newGroupValue: string,
+		newSwimLaneValue: string | null,
+		dropTarget?: { taskPath: string; above: boolean }
+	): Promise<void> {
+		this.activeDropCount++;
+		try {
+		await this.dropQueue.enqueue(taskPath, async () => {
+			// Suppress renders immediately — dragend clears draggedTaskPath
+			// during our awaits, so onDataUpdated needs another way to know
+			// not to render with stale data.
+			this.suppressRenderUntil = Date.now() + 10000; // extended window, tightened at end
+
+			// Get the groupBy property from the controller
+			const groupByPropertyId = this.getGroupByPropertyId();
+			if (!groupByPropertyId) return;
+
+			// Check if groupBy is a formula - formulas are read-only
+			if (groupByPropertyId.startsWith("formula.")) {
+				new Notice(
+					this.plugin.i18n.translate("views.kanban.errors.formulaGroupingReadOnly")
+				);
+				return;
+			}
+
+			// Check if swimlane is a formula - formulas are read-only
+			if (newSwimLaneValue !== null && this.swimLanePropertyId?.startsWith("formula.")) {
+				new Notice(
+					this.plugin.i18n.translate("views.kanban.errors.formulaSwimlaneReadOnly")
+				);
+				return;
+			}
+
+			const cleanGroupBy = stripPropertyPrefix(groupByPropertyId);
+			const isGroupByListProperty =
+				this.explodeListColumns && this.isListTypeProperty(cleanGroupBy);
+
+			// Check if swimlane property is also a list type
+			const cleanSwimlane = this.swimLanePropertyId
+				? stripPropertyPrefix(this.swimLanePropertyId)
+				: null;
+			const isSwimlaneListProperty = cleanSwimlane && this.isListTypeProperty(cleanSwimlane);
+
+			// Snapshot drag state NOW — dragend fires during our awaits and
+			// clears these instance properties out from under us.
+			const snapshotFromColumn = this.draggedFromColumn;
+			const snapshotFromSwimlane = this.draggedFromSwimlane;
+			const snapshotSourceColumns = new Map(this.draggedSourceColumns);
+			const snapshotSourceSwimlanes = new Map(this.draggedSourceSwimlanes);
+
+			// Handle batch drag - update all dragged tasks
+			const pathsToUpdate =
+				this.draggedTaskPaths.length > 1 ? [...this.draggedTaskPaths] : [taskPath];
+			const isBatchOperation = pathsToUpdate.length > 1;
+
+			// Pre-compute sort_order related state
+			const hasSortOrder = isSortOrderInSortConfig(this.dataAdapter, this.plugin.settings.fieldMapping.sortOrder);
+			const sortOrderField = this.plugin.settings.fieldMapping.sortOrder;
+			const cleanGroupByForSort = stripPropertyPrefix(groupByPropertyId);
+			const cleanSwimLaneForSort = this.swimLanePropertyId
+				? stripPropertyPrefix(this.swimLanePropertyId) : null;
+			const sortScopeFilters = newSwimLaneValue !== null && cleanSwimLaneForSort
+				? [{ property: cleanSwimLaneForSort, value: newSwimLaneValue }]
+				: undefined;
+			const visibleTaskPaths = this.getVisibleSortScopePaths(newGroupValue, newSwimLaneValue);
+			const candidateTaskPaths = this.getCandidateSortScopePaths(newGroupValue, newSwimLaneValue);
+
+			this.debugLog("SORT-ORDER-CHECK", {
+				hasDropTarget: !!dropTarget,
+				hasSortOrder,
+				dropTarget: dropTarget ? { file: dropTarget.taskPath.split("/").pop(), above: dropTarget.above } : null,
+			});
+
+			// Detect if the groupBy / swimlane property maps to a known TaskInfo field
+			// so we can fire side effects (completedDate, auto-archive, webhooks, etc.)
+			const groupByTaskProp = this.plugin.fieldMapper.lookupMappingKey(cleanGroupBy);
+			const swimlaneTaskProp = cleanSwimlane
+				? this.plugin.fieldMapper.lookupMappingKey(cleanSwimlane)
+				: null;
+
+			for (const path of pathsToUpdate) {
+				// Get the source column and swimlane for this specific task
+				const sourceColumn = isBatchOperation
+					? snapshotSourceColumns.get(path)
+					: snapshotFromColumn;
+				const sourceSwimlane = isBatchOperation
+					? snapshotSourceSwimlanes.get(path)
+					: snapshotFromSwimlane;
+
+				// Detect same-column drop — skip group property update to avoid
+				// unnecessary writes or value corruption
+				const isSameColumn = sourceColumn === newGroupValue;
+				const isSameSwimlane = sourceSwimlane === newSwimLaneValue;
+
+				this.debugLog("HANDLE-DROP-TASK", {
+					taskFile: path.split("/").pop(),
+					sourceColumn,
+					newGroupValue,
+					isSameColumn,
+					isGroupByListProperty,
+					sourceSwimlane,
+					newSwimLaneValue,
+				});
+
+				const needsGroupUpdate = !isSameColumn;
+				const needsSwimlaneUpdate = newSwimLaneValue !== null && !!this.swimLanePropertyId && !isSameSwimlane;
+
+				// Compute sort_order first (read-only — no file writes yet)
+				let sortOrderPlan = null;
+				if (hasSortOrder) {
+					if (dropTarget) {
+						this.debugLog("COMPUTE-SORT-ORDER-CALL", {
+							taskFile: path.split("/").pop(),
+							targetFile: dropTarget.taskPath.split("/").pop(),
+							above: dropTarget.above,
+							groupKey: newGroupValue,
+							cleanGroupBy: cleanGroupByForSort,
+							cleanSwimLane: cleanSwimLaneForSort,
+						});
+
+						sortOrderPlan = await prepareSortOrderUpdate(
+							dropTarget.taskPath,
+							dropTarget.above,
+							newGroupValue,
+							cleanGroupByForSort,
+							path,
+							this.plugin,
+							{
+								scopeFilters: sortScopeFilters,
+								taskInfoCache: this.taskInfoCache,
+								visibleTaskPaths,
+								candidateTaskPaths,
+							}
+						);
+						if (sortOrderPlan.sortOrder === null) {
+							continue;
+						}
+
+						const totalEditedNotes = sortOrderPlan.additionalWrites.length + 1;
+						if (totalEditedNotes > this.LARGE_REORDER_WARNING_THRESHOLD) {
+							const confirmed = await this.confirmLargeReorder(
+								totalEditedNotes,
+								newGroupValue,
+								newSwimLaneValue
+							);
+							if (!confirmed) return;
+						}
+					} else {
+						// No specific drop target (cross-column drop without card position).
+						// Preserve the task's existing sort_order so it retains its
+						// relative position when moved back.  The user can always drop
+						// ON a specific card to choose a precise position.
+						this.debugLog("SORT-ORDER-CROSS-COLUMN-PRESERVE", {
+							taskFile: path.split("/").pop(),
+							groupKey: newGroupValue,
+						});
+					}
+
+					this.debugLog("SORT-ORDER-RESULT", {
+						taskFile: path.split("/").pop(),
+						newSortOrder: sortOrderPlan?.sortOrder ?? null,
+						isNull: sortOrderPlan?.sortOrder === null,
+						additionalWrites: sortOrderPlan?.additionalWrites.length ?? 0,
+					});
+				}
+
+				// Skip file write if nothing to change
+				const needsWrite = needsGroupUpdate || needsSwimlaneUpdate || sortOrderPlan !== null;
+				if (!needsWrite) continue;
+
+				const file = this.plugin.app.vault.getAbstractFileByPath(path);
+				if (!file || !(file instanceof TFile)) continue;
+
+				if (sortOrderPlan) {
+					await applySortOrderPlan(path, sortOrderPlan, this.plugin, { includeDragged: false });
+				}
+
+				// Single atomic write: groupBy + swimlane + sort_order
+				await this.plugin.app.fileManager.processFrontMatter(file, (fm) => {
+					// Update groupBy property if changing columns
+					if (needsGroupUpdate) {
+						const frontmatterKey = groupByPropertyId.replace(/^(note\.|file\.|task\.)/, "");
+						if (isGroupByListProperty && sourceColumn) {
+							// List property: remove source value, add target value
+							let currentValue = fm[frontmatterKey];
+							if (!Array.isArray(currentValue)) {
+								currentValue = currentValue ? [currentValue] : [];
+							}
+							const newValue = currentValue.filter((v: string) => v !== sourceColumn);
+							if (!newValue.includes(newGroupValue) && newGroupValue !== "None") {
+								newValue.push(newGroupValue);
+							}
+							fm[frontmatterKey] = newValue.length > 0 ? newValue : [];
+						} else {
+							fm[frontmatterKey] = newGroupValue;
+						}
+					}
+
+					// Update swimlane property if changing swimlanes
+					if (needsSwimlaneUpdate) {
+						const swimKey = this.swimLanePropertyId!.replace(/^(note\.|file\.|task\.)/, "");
+						if (isSwimlaneListProperty && sourceSwimlane) {
+							let currentValue = fm[swimKey];
+							if (!Array.isArray(currentValue)) {
+								currentValue = currentValue ? [currentValue] : [];
+							}
+							const newValue = currentValue.filter((v: string) => v !== sourceSwimlane);
+							if (!newValue.includes(newSwimLaneValue!) && newSwimLaneValue !== "None") {
+								newValue.push(newSwimLaneValue!);
+							}
+							fm[swimKey] = newValue.length > 0 ? newValue : [];
+						} else {
+							fm[swimKey] = newSwimLaneValue;
+						}
+					}
+
+					// Write sort_order
+					if (sortOrderPlan?.sortOrder !== null && sortOrderPlan) {
+						fm[sortOrderField] = sortOrderPlan.sortOrder;
+					}
+
+					// Derivative writes for status changes (completedDate + dateModified)
+					if (needsGroupUpdate && groupByTaskProp === "status") {
+						const task = this.taskInfoCache.get(path);
+						const isRecurring = !!(task?.recurrence);
+						this.plugin.taskService.updateCompletedDateInFrontmatter(fm, newGroupValue, isRecurring);
+						const dateModifiedField = this.plugin.fieldMapper.toUserField("dateModified");
+						fm[dateModifiedField] = getCurrentTimestamp();
+					} else if (needsSwimlaneUpdate && swimlaneTaskProp === "status") {
+						const task = this.taskInfoCache.get(path);
+						const isRecurring = !!(task?.recurrence);
+						this.plugin.taskService.updateCompletedDateInFrontmatter(fm, newSwimLaneValue!, isRecurring);
+						const dateModifiedField = this.plugin.fieldMapper.toUserField("dateModified");
+						fm[dateModifiedField] = getCurrentTimestamp();
+					}
+				});
+
+				this.debugLog("ATOMIC-WRITE-DONE", {
+					taskFile: path.split("/").pop(),
+					needsGroupUpdate,
+					needsSwimlaneUpdate,
+					hasSortOrder: sortOrderPlan !== null,
+				});
+
+				// Fire post-write side effects for known TaskInfo property changes
+				const changedTaskProp = needsGroupUpdate ? groupByTaskProp
+					: needsSwimlaneUpdate ? swimlaneTaskProp
+					: null;
+				if (changedTaskProp) {
+					const oldPropValue = needsGroupUpdate ? sourceColumn : sourceSwimlane;
+					const newPropValue = needsGroupUpdate ? newGroupValue : newSwimLaneValue;
+					try {
+						const originalTask = this.taskInfoCache.get(path) ??
+							await this.plugin.cacheManager.getTaskInfo(path);
+						if (originalTask) {
+							const updatedTask = { ...originalTask, [changedTaskProp]: newPropValue } as TaskInfo;
+							updatedTask.dateModified = getCurrentTimestamp();
+							if (changedTaskProp === "status" && !originalTask.recurrence) {
+								if (this.plugin.statusManager.isCompletedStatus(newPropValue as string)) {
+									updatedTask.completedDate = new Date().toISOString().split("T")[0];
+								} else {
+									updatedTask.completedDate = undefined;
+								}
+							}
+							await this.plugin.taskService.applyPropertyChangeSideEffects(
+								file, originalTask, updatedTask,
+								changedTaskProp as keyof TaskInfo,
+								oldPropValue, newPropValue
+							);
+						}
+					} catch (sideEffectError) {
+						console.warn("[TaskNotes][KanbanView] Side-effect error after drop:", sideEffectError);
+					}
+				}
+			}
+
+			// Clear selection after batch move
+			if (isBatchOperation) {
+				this.plugin.taskSelectionService?.clearSelection();
+				this.plugin.taskSelectionService?.exitSelectionMode();
+			}
+
+			this.debugLog("HANDLE-DROP-COMPLETE", { pathsUpdated: pathsToUpdate.map(p => p.split("/").pop()) });
+		}); // end dropQueue.enqueue
+		} catch (error) {
+			console.error("[TaskNotes][KanbanView] Error updating task:", error);
+		} finally {
+			this.activeDropCount--;
+			if (this.activeDropCount === 0) {
+				this.schedulePostDropRender();
+			}
+		}
+	}
+
+	protected setupContainer(): void {
+		super.setupContainer();
+
+		// Use containerEl.ownerDocument for pop-out window support
+		const doc = this.containerEl.ownerDocument;
+		const board = doc.createElement("div");
+		board.className = "kanban-view__board";
+		this.rootElement?.appendChild(board);
+		this.boardEl = board;
+		this.registerBoardListeners();
+	}
+
+	protected async handleTaskUpdate(task: TaskInfo): Promise<void> {
+		// For kanban, just do full refresh since cards might move columns
+		this.debouncedRefresh();
+	}
+
+	/**
+	 * Override debouncedRefresh to preserve scroll positions during re-renders.
+	 * Saves ephemeral state before render and restores it after.
+	 */
+	protected debouncedRefresh(): void {
+		if ((this as any).updateDebounceTimer) {
+			this.debugLog("DEBOUNCED-REFRESH: cancelling previous pending timer");
+			clearTimeout((this as any).updateDebounceTimer);
+		}
+
+		this.debugLog("DEBOUNCED-REFRESH: scheduling render in 150ms", {
+			activeDropCount: this.activeDropCount,
+			suppressRenderRemaining: Math.max(0, this.suppressRenderUntil - Date.now()),
+		});
+
+		// Save current scroll state before the timer fires
+		const savedState = this.getEphemeralState();
+
+		// Use correct window for pop-out window support
+		const win = this.containerEl.ownerDocument.defaultView || window;
+		(this as any).updateDebounceTimer = win.setTimeout(async () => {
+			// Respect render suppression — a drop is still in-flight.
+			// The post-drop render (schedulePostDropRender) will fire the
+			// guaranteed render once the writes have settled.
+			if (this.activeDropCount > 0 || Date.now() < this.suppressRenderUntil) {
+				this.debugLog("DEBOUNCED-REFRESH-TIMER-FIRED: SKIPPED (drop still in-flight)", {
+					activeDropCount: this.activeDropCount,
+					suppressRenderRemaining: Math.max(0, this.suppressRenderUntil - Date.now()),
+				});
+				(this as any).updateDebounceTimer = null;
+				return;
+			}
+			this.debugLog("DEBOUNCED-REFRESH-TIMER-FIRED: executing render now", {
+				activeDropCount: this.activeDropCount,
+				suppressRenderRemaining: Math.max(0, this.suppressRenderUntil - Date.now()),
+			});
+			await this.render();
+			(this as any).updateDebounceTimer = null;
+			// Restore scroll state after render completes
+			this.setEphemeralState(savedState);
+		}, 150);
+	}
+
+	private static readonly POST_DROP_RENDER_DELAY = 500; // ms
+
+	private debugLog(msg: string, data?: Record<string, unknown>): void {
+		if (!this.plugin.settings.enableDebugLogging) return;
+		const ts = new Date().toISOString().slice(11, 23);
+		if (data) {
+			console.debug(`[TN-DBG ${ts}] ${msg}`, JSON.stringify(data));
+		} else {
+			console.debug(`[TN-DBG ${ts}] ${msg}`);
+		}
+	}
+
+	private schedulePostDropRender(): void {
+		this.debugLog("SCHEDULE-POST-DROP-RENDER", { delay: KanbanView.POST_DROP_RENDER_DELAY });
+		this.suppressRenderUntil = Date.now() + KanbanView.POST_DROP_RENDER_DELAY;
+		this.pendingRender = false;
+
+		if (this.postDropTimer) clearTimeout(this.postDropTimer);
+
+		const win = this.containerEl.ownerDocument.defaultView || window;
+		this.postDropTimer = win.setTimeout(() => {
+			this.debugLog("POST-DROP-TIMER-FIRED: rendering now");
+			this.postDropTimer = null;
+			this.suppressRenderUntil = 0;
+			this.debouncedRefresh();
+		}, KanbanView.POST_DROP_RENDER_DELAY);
+	}
+
+	private renderEmptyState(): void {
+		if (!this.boardEl) return;
+		// Use containerEl.ownerDocument for pop-out window support
+		const doc = this.containerEl.ownerDocument;
+		const empty = doc.createElement("div");
+		empty.className = "tn-bases-empty";
+		empty.textContent = "No TaskNotes tasks found for this Base.";
+		this.boardEl.appendChild(empty);
+	}
+
+	private renderNoGroupByError(): void {
+		if (!this.boardEl) return;
+		// Use containerEl.ownerDocument for pop-out window support
+		const doc = this.containerEl.ownerDocument;
+		const error = doc.createElement("div");
+		error.className = "tn-bases-error";
+		error.textContent = this.plugin.i18n.translate("views.kanban.errors.noGroupBy");
+		this.boardEl.appendChild(error);
+	}
+
+	renderError(error: Error): void {
+		if (!this.boardEl) return;
+		// Use containerEl.ownerDocument for pop-out window support
+		const doc = this.containerEl.ownerDocument;
+		const errorEl = doc.createElement("div");
+		errorEl.className = "tn-bases-error";
+		errorEl.textContent = `Error loading kanban: ${error.message || "Unknown error"}`;
+		this.boardEl.appendChild(errorEl);
+	}
+
+	/**
+	 * Compute Bases formulas for TaskNotes items.
+	 * Ensures formula-based properties (e.g. dueDateCategory) are populated
+	 * before swimlane/grouping reads them from cachedFormulaOutputs.
+	 */
+	private async computeFormulas(dataItems: BasesDataItem[]): Promise<void> {
+		const ctxFormulas = (this.data as any)?.ctx?.formulas;
+		if (!ctxFormulas || typeof ctxFormulas !== "object" || dataItems.length === 0) {
+			return;
+		}
+
+		for (let i = 0; i < dataItems.length; i++) {
+			const item = dataItems[i];
+			const itemFormulaResults = item.basesData?.formulaResults;
+			if (!itemFormulaResults?.cachedFormulaOutputs) continue;
+
+			for (const formulaName of Object.keys(ctxFormulas)) {
+				const formula = ctxFormulas[formulaName];
+				if (formula && typeof formula.getValue === "function") {
+					try {
+						const baseData = item.basesData;
+						const taskProperties = item.properties || {};
+
+						let result;
+
+						if (baseData.frontmatter && Object.keys(taskProperties).length > 0) {
+							const originalFrontmatter = baseData.frontmatter;
+							baseData.frontmatter = {
+								...originalFrontmatter,
+								...taskProperties,
+							};
+							result = formula.getValue(baseData);
+							baseData.frontmatter = originalFrontmatter;
+						} else {
+							result = formula.getValue(baseData);
+						}
+
+						if (result !== undefined) {
+							itemFormulaResults.cachedFormulaOutputs[formulaName] = result;
+						}
+					} catch (e) {
+						// Formulas may fail for various reasons - this is expected
+					}
+				}
+			}
+		}
+	}
+
+	private buildPathToPropsMap(): Map<string, Record<string, any>> {
+		const dataItems = this.dataAdapter.extractDataItems();
+		const map = new Map<string, Record<string, any>>();
+
+		for (const item of dataItems) {
+			if (!item.path) continue;
+
+			// Merge regular properties with formula results
+			const props = { ...(item.properties || {}) };
+
+			// Add formula results if available
+			const formulaOutputs = item.basesData?.formulaResults?.cachedFormulaOutputs;
+			if (formulaOutputs && typeof formulaOutputs === "object") {
+				for (const [formulaName, value] of Object.entries(formulaOutputs)) {
+					// Store with formula. prefix for easy lookup
+					props[`formula.${formulaName}`] = value;
+				}
+			}
+
+			map.set(item.path, props);
+		}
+
+		return map;
+	}
+
+	private getPropertyValue(props: Record<string, any>, propertyId: string): any {
+		// Formula properties are stored with their full prefix (formula.NAME)
+		if (propertyId.startsWith("formula.")) {
+			return props[propertyId] ?? null;
+		}
+
+		// Strip prefix from property ID if present
+		const cleanId = stripPropertyPrefix(propertyId);
+
+		// Try exact match first
+		if (props[propertyId] !== undefined) return props[propertyId];
+		if (props[cleanId] !== undefined) return props[cleanId];
+
+		return null;
+	}
+
+	
+
+	private valueToString(value: any): string {
+		if (value === null || value === undefined) return "None";
+
+		// Handle Bases Value objects (they have a toString() method and often a type property)
+		// Check for Bases Value object by duck-typing (has toString and is an object with constructor)
+		if (typeof value === "object" && value !== null && typeof value.toString === "function") {
+			// Check if it's a Bases NullValue
+			if (value.constructor?.name === "NullValue" || (value.isTruthy && !value.isTruthy())) {
+				return "None";
+			}
+
+			// Check if it's a Bases ListValue (array-like)
+			if (value.constructor?.name === "ListValue" || Array.isArray(value.value)) {
+				const arr = value.value || [];
+				if (arr.length === 0) return "None";
+				// Recursively convert each item
+				return arr.map((v: any) => this.valueToString(v)).join(", ");
+			}
+
+			// For other Bases Value types (StringValue, NumberValue, BooleanValue, DateValue, etc.)
+			// Use their toString() method
+			const str = value.toString();
+			return str || "None";
+		}
+
+		if (typeof value === "string") return value || "None";
+		if (typeof value === "number") return String(value);
+		if (typeof value === "boolean") return value ? "True" : "False";
+		if (Array.isArray(value))
+			return value.length > 0 ? value.map((v) => this.valueToString(v)).join(", ") : "None";
+		return String(value);
+	}
+
+	private getGroupDisplayTitle(title: string, propertyId?: string | null): string {
+		if (!propertyId) {
+			return title;
+		}
+
+		const cleanProperty = stripPropertyPrefix(propertyId);
+
+		const statusField = this.plugin.fieldMapper.toUserField("status");
+		if (cleanProperty === statusField) {
+			const statusConfig = this.plugin.statusManager.getStatusConfig(title);
+			if (statusConfig?.label) {
+				return statusConfig.label;
+			}
+		}
+
+		const priorityField = this.plugin.fieldMapper.toUserField("priority");
+		if (cleanProperty === priorityField) {
+			const priorityConfig = this.plugin.priorityManager.getPriorityConfig(title);
+			if (priorityConfig?.label) {
+				return priorityConfig.label;
+			}
+		}
+
+		return title;
+	}
+
+	private renderGroupTitleWrapper(container: HTMLElement, title: string, isSwimLane = false, skipIcon = false): void {
+		// When grouped by status (column or swimlane), show label instead of raw value
+		const isStatusGrouping = isSwimLane ? this.isSwimLaneByStatus() : this.isGroupedByStatus();
+		if (isStatusGrouping) {
+			const statusConfig = this.plugin.statusManager.getStatusConfig(title);
+			if (statusConfig) {
+				// Only show icon in title when consolidation is enabled
+				if (this.consolidateStatusIcon && !skipIcon && statusConfig.icon) {
+					const iconEl = container.createSpan({ cls: "kanban-view__column-icon" });
+					iconEl.style.color = statusConfig.color;
+					setIcon(iconEl, statusConfig.icon);
+				}
+				container.createSpan({ text: statusConfig.label });
+				return;
+			}
+		}
+
+		// Default: use link-aware title rendering
+		const propertyId = isSwimLane ? this.swimLanePropertyId : this.getGroupByPropertyId();
+		const displayTitle = this.getGroupDisplayTitle(title, propertyId);
+		const app = this.app || this.plugin.app;
+		const linkServices: LinkServices = {
+			metadataCache: app.metadataCache,
+			workspace: app.workspace,
+		};
+		renderGroupTitle(container, displayTitle, linkServices);
+	}
+
+	private applyColumnOrder(groupBy: string, actualKeys: string[]): string[] {
+		// Get saved order for this grouping property
+		const savedOrder = this.columnOrders[groupBy];
+
+		if (!savedOrder || savedOrder.length === 0) {
+			// No saved order - use natural order (alphabetical)
+			return actualKeys.sort();
+		}
+
+		const ordered: string[] = [];
+		const unsorted: string[] = [];
+
+		// First, add keys in saved order
+		for (const key of savedOrder) {
+			if (actualKeys.includes(key)) {
+				ordered.push(key);
+			}
+		}
+
+		// Then, add any new keys not in saved order
+		for (const key of actualKeys) {
+			if (!savedOrder.includes(key)) {
+				unsorted.push(key);
+			}
+		}
+
+		// Return saved order + new keys (alphabetically sorted)
+		return [...ordered, ...unsorted.sort()];
+	}
+
+	private async saveColumnOrder(groupBy: string, order: string[]): Promise<void> {
+		// Update in-memory state
+		this.columnOrders[groupBy] = order;
+
+		try {
+			// Serialize to JSON
+			const orderJson = JSON.stringify(this.columnOrders);
+
+			// Save to config using BasesViewConfig API
+			this.config.set("columnOrder", orderJson);
+		} catch (error) {
+			console.error("[KanbanView] Failed to save column order:", error);
+		}
+	}
+
+	/**
+	 * Get consistent card rendering options for all kanban cards
+	 */
+	private getCardOptions() {
+		// Use UTC-anchored "today" for correct recurring task completion status
+		const now = new Date();
+		const targetDate = new Date(Date.UTC(now.getFullYear(), now.getMonth(), now.getDate()));
+
+		// Hide status indicators on cards when consolidation is enabled and grouped by status
+		const hideStatusIndicator = this.consolidateStatusIcon && this.isGroupedByStatus();
+
+		return this.buildTaskCardOptions({
+			targetDate,
+			hideStatusIndicator,
+			expandedRelationshipFilterMode: this.expandedRelationshipFilterMode,
+			expandedRelationshipTaskPaths: this.currentVisibleTaskPaths,
+		});
+	}
+
+	private setCurrentVisibleTaskPaths(tasks: TaskInfo[]): void {
+		this.currentVisibleTaskPaths.clear();
+		for (const task of tasks) {
+			this.currentVisibleTaskPaths.add(task.path);
+		}
+	}
+
+	/**
+	 * Check if the view is currently grouped by the status property
+	 */
+	private isGroupedByStatus(): boolean {
+		const groupByPropertyId = this.getGroupByPropertyId();
+		if (!groupByPropertyId) return false;
+
+		const statusPropertyName = this.plugin.fieldMapper.toUserField('status');
+		const cleanGroupBy = groupByPropertyId.replace(/^(note\.|file\.|task\.)/, '');
+		return cleanGroupBy === statusPropertyName;
+	}
+
+	/**
+	 * Check if swimlanes are grouped by the status property
+	 */
+	private isSwimLaneByStatus(): boolean {
+		if (!this.swimLanePropertyId) return false;
+
+		const statusPropertyName = this.plugin.fieldMapper.toUserField('status');
+		const cleanSwimLane = this.swimLanePropertyId.replace(/^(note\.|file\.|task\.)/, '');
+		return cleanSwimLane === statusPropertyName;
+	}
+
+	private registerBoardListeners(): void {
+		// Task cards now handle their own events - no delegation needed
+	}
+
+	private unregisterBoardListeners(): void {
+		// No listeners to unregister
+	}
+
+	private getTaskContextFromEvent(event: Event): { task: TaskInfo; card: HTMLElement } | null {
+		const target = event.target as HTMLElement | null;
+		if (!target) return null;
+		const card = target.closest<HTMLElement>(".task-card");
+		if (!card) return null;
+		const wrapper = card.closest<HTMLElement>(".kanban-view__card-wrapper");
+		if (!wrapper) return null;
+		const path = wrapper.dataset.taskPath;
+		if (!path) return null;
+		const task = this.taskInfoCache.get(path);
+		if (!task) return null;
+		return { task, card };
+	}
+
+	private handleBoardClick = async (event: MouseEvent) => {
+		const context = this.getTaskContextFromEvent(event);
+		if (!context) return;
+
+		const { task, card } = context;
+		const target = event.target as HTMLElement;
+		const actionEl = target.closest<HTMLElement>("[data-tn-action]");
+
+		if (actionEl && actionEl !== card) {
+			const action = actionEl.dataset.tnAction;
+			if (action) {
+				event.preventDefault();
+				event.stopPropagation();
+				await this.handleCardAction(action, task, actionEl, event);
+				return;
+			}
+		}
+	};
+
+	private handleBoardContextMenu = async (event: MouseEvent) => {
+		const context = this.getTaskContextFromEvent(event);
+		if (!context) return;
+		event.preventDefault();
+		event.stopPropagation();
+
+		const { showTaskContextMenu } = await import("../ui/TaskCard");
+		await showTaskContextMenu(
+			event,
+			context.task.path,
+			this.plugin,
+			this.getTaskActionDate(context.task)
+		);
+	};
+
+	private async handleCardAction(
+		action: string,
+		task: TaskInfo,
+		target: HTMLElement,
+		event: MouseEvent
+	): Promise<void> {
+		// Import handlers dynamically to avoid circular dependencies
+		const [
+			{ DateContextMenu },
+			{ PriorityContextMenu },
+			{ RecurrenceContextMenu },
+			{ ReminderModal },
+			{ showTaskContextMenu },
+		] = await Promise.all([
+			import("../components/DateContextMenu"),
+			import("../components/PriorityContextMenu"),
+			import("../components/RecurrenceContextMenu"),
+			import("../modals/ReminderModal"),
+			import("../ui/TaskCard"),
+		]);
+
+		switch (action) {
+			case "toggle-status":
+				await this.handleToggleStatus(task, event);
+				return;
+			case "priority-menu":
+				this.showPriorityMenu(task, event, PriorityContextMenu);
+				return;
+			case "recurrence-menu":
+				this.showRecurrenceMenu(task, event, RecurrenceContextMenu);
+				return;
+			case "reminder-menu":
+				this.showReminderModal(task, ReminderModal);
+				return;
+			case "task-context-menu":
+				await showTaskContextMenu(
+					event,
+					task.path,
+					this.plugin,
+					this.getTaskActionDate(task)
+				);
+				return;
+			case "edit-date":
+				await this.openDateContextMenu(
+					task,
+					target.dataset.tnDateType as "due" | "scheduled" | undefined,
+					event,
+					DateContextMenu
+				);
+				return;
+			case "toggle-subtasks":
+				await this.handleToggleSubtasks(task, target);
+				return;
+			case "toggle-blocking-tasks":
+				await this.handleToggleBlockingTasks(task, target);
+				return;
+		}
+	}
+
+	private async handleToggleStatus(task: TaskInfo, event: MouseEvent): Promise<void> {
+		try {
+			if (task.recurrence) {
+				const actionDate = this.getTaskActionDate(task);
+				await this.plugin.toggleRecurringTaskComplete(task, actionDate);
+			} else {
+				await this.plugin.toggleTaskStatus(task);
+			}
+		} catch (error) {
+			console.error("[TaskNotes][KanbanView] Failed to toggle status", error);
+		}
+	}
+
+	/**
+	 * Determine the date to use when completing a recurring task from Bases.
+	 * Prefers the task's scheduled (or due) date to avoid marking the wrong instance.
+	 */
+	private getTaskActionDate(task: TaskInfo): Date {
+		const dateStr = getDatePart(task.scheduled || task.due || "");
+		if (dateStr) {
+			return parseDateToUTC(dateStr);
+		}
+
+		// Fallback to today's date, UTC-anchored to preserve local calendar day
+		return createUTCDateFromLocalCalendarDate(new Date());
+	}
+
+	private showPriorityMenu(task: TaskInfo, event: MouseEvent, PriorityContextMenu: any): void {
+		const menu = new PriorityContextMenu({
+			currentValue: task.priority,
+			onSelect: async (newPriority: any) => {
+				try {
+					await this.plugin.updateTaskProperty(task, "priority", newPriority);
+				} catch (error) {
+					console.error("[TaskNotes][KanbanView] Failed to update priority", error);
+				}
+			},
+			plugin: this.plugin,
+		});
+		menu.show(event);
+	}
+
+	private showRecurrenceMenu(
+		task: TaskInfo,
+		event: MouseEvent,
+		RecurrenceContextMenu: any
+	): void {
+		const menu = new RecurrenceContextMenu({
+			currentValue: typeof task.recurrence === "string" ? task.recurrence : undefined,
+			currentAnchor: task.recurrence_anchor || "scheduled",
+			scheduledDate: task.scheduled,
+			onSelect: async (newRecurrence: string | null, anchor?: "scheduled" | "completion") => {
+				try {
+					await this.plugin.updateTaskProperty(
+						task,
+						"recurrence",
+						newRecurrence || undefined
+					);
+					if (anchor !== undefined) {
+						await this.plugin.updateTaskProperty(task, "recurrence_anchor", anchor);
+					}
+				} catch (error) {
+					console.error("[TaskNotes][KanbanView] Failed to update recurrence", error);
+				}
+			},
+			app: this.plugin.app,
+			plugin: this.plugin,
+		});
+		menu.show(event);
+	}
+
+	private showReminderModal(task: TaskInfo, ReminderModal: any): void {
+		const modal = new ReminderModal(
+			this.plugin.app,
+			this.plugin,
+			task,
+			async (reminders: any) => {
+				try {
+					await this.plugin.updateTaskProperty(
+						task,
+						"reminders",
+						reminders.length > 0 ? reminders : undefined
+					);
+				} catch (error) {
+					console.error("[TaskNotes][KanbanView] Failed to update reminders", error);
+				}
+			}
+		);
+		modal.open();
+	}
+
+	private async openDateContextMenu(
+		task: TaskInfo,
+		dateType: "due" | "scheduled" | undefined,
+		event: MouseEvent,
+		DateContextMenu: any
+	): Promise<void> {
+		if (!dateType) return;
+
+		const { getDatePart, getTimePart } = await import("../utils/dateUtils");
+		const currentValue = dateType === "due" ? task.due : task.scheduled;
+
+		const menu = new DateContextMenu({
+			currentValue: getDatePart(currentValue || ""),
+			currentTime: getTimePart(currentValue || ""),
+			onSelect: async (dateValue: string, timeValue: string) => {
+				try {
+					let finalValue: string | undefined;
+					if (!dateValue) {
+						finalValue = undefined;
+					} else if (timeValue) {
+						finalValue = `${dateValue}T${timeValue}`;
+					} else {
+						finalValue = dateValue;
+					}
+					await this.plugin.updateTaskProperty(task, dateType, finalValue);
+				} catch (error) {
+					console.error("[TaskNotes][KanbanView] Failed to update date", error);
+				}
+			},
+			plugin: this.plugin,
+			app: this.app || this.plugin.app,
+		});
+		menu.show(event);
+	}
+
+	private async handleToggleSubtasks(task: TaskInfo, chevronElement: HTMLElement): Promise<void> {
+		const { toggleSubtasks } = await import("../ui/TaskCard");
+		const card = chevronElement.closest<HTMLElement>(".task-card");
+		if (!card) return;
+
+		// Toggle expansion state
+		const isExpanded = this.plugin.expandedProjectsService?.isExpanded(task.path) || false;
+		const newExpanded = !isExpanded;
+
+		if (newExpanded) {
+			this.plugin.expandedProjectsService?.setExpanded(task.path, true);
+		} else {
+			this.plugin.expandedProjectsService?.setExpanded(task.path, false);
+		}
+
+		// Update chevron rotation
+		chevronElement.classList.toggle("is-rotated", newExpanded);
+
+		// Toggle subtasks display
+		await toggleSubtasks(card, task, this.plugin, newExpanded);
+	}
+
+	private async handleToggleBlockingTasks(
+		task: TaskInfo,
+		toggleElement: HTMLElement
+	): Promise<void> {
+		const { toggleBlockingTasks } = await import("../ui/TaskCard");
+		const card = toggleElement.closest<HTMLElement>(".task-card");
+		if (!card) return;
+
+		// Toggle expansion state via CSS class
+		const expanded = toggleElement.classList.toggle("task-card__blocking-toggle--expanded");
+
+		// Toggle blocking tasks display
+		await toggleBlockingTasks(card, task, this.plugin, expanded);
+	}
+
+	private destroyColumnScrollers(): void {
+		for (const scroller of this.columnScrollers.values()) {
+			scroller.destroy();
+		}
+		this.columnScrollers.clear();
+	}
+
+	/**
+	 * Component lifecycle: Called when component is unloaded.
+	 * Override from Component base class.
+	 */
+	onunload(): void {
+		if (this.postDropTimer) {
+			clearTimeout(this.postDropTimer);
+			this.postDropTimer = null;
+		}
+		this.suppressRenderUntil = 0;
+
+		// Component.register() calls will be automatically cleaned up
+		// We just need to clean up view-specific state
+		this.unregisterBoardListeners();
+		this.destroyColumnScrollers();
+		this.currentTaskElements.clear();
+		this.taskInfoCache.clear();
+		this.sortScopeTaskPaths.clear();
+		this.boardEl = null;
+	}
+}
+
+/**
+ * Factory function for Bases registration.
+ * Returns an actual KanbanView instance (extends BasesView).
+ */
+export function buildKanbanViewFactory(plugin: TaskNotesPlugin) {
+	return function (controller: any, containerEl: HTMLElement): KanbanView {
+		if (!containerEl) {
+			console.error("[TaskNotes][KanbanView] No containerEl provided");
+			throw new Error("KanbanView requires a containerEl");
+		}
+
+		// Create and return the view instance directly
+		// KanbanView now properly extends BasesView, so Bases can call its methods directly
+		return new KanbanView(controller, containerEl, plugin);
+	};
+}
