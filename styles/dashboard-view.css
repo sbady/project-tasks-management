@@ -195,15 +195,21 @@
 .dashboard-v2__planner-range {
 	display: flex;
 	align-items: center;
-	justify-content: space-between;
+	justify-content: flex-start;
 	gap: 10px;
 	margin-top: -2px;
 	margin-bottom: 6px;
 }
 
+.dashboard-v2__planner-range-nav {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+	flex-shrink: 0;
+}
+
 .dashboard-v2__planner-range-label {
-	flex: 1;
-	text-align: center;
+	text-align: left;
 	font-size: 13px;
 	font-weight: 650;
 	letter-spacing: -0.01em;

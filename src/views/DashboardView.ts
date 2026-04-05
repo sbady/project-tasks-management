@@ -541,7 +541,8 @@ export class DashboardView extends ItemView {
 		if (groups.length === 0) return;
 
 		const header = container.createDiv({ cls: "dashboard-v2__planner-range" });
-		const previousButton = this.createIconButton(header, "chevron-left", "Previous week");
+		const nav = header.createDiv({ cls: "dashboard-v2__planner-range-nav" });
+		const previousButton = this.createIconButton(nav, "chevron-left", "Previous week");
 		this.registerDomEvent(previousButton, "click", () => {
 			this.selectedDate = format(addDays(parseDateAsLocal(this.selectedDate), -7), "yyyy-MM-dd");
 			void this.refresh();
@@ -552,7 +553,7 @@ export class DashboardView extends ItemView {
 			text: this.formatPlannerWeekRange(groups[0].date, groups[groups.length - 1].date),
 		});
 
-		const nextButton = this.createIconButton(header, "chevron-right", "Next week");
+		const nextButton = this.createIconButton(nav, "chevron-right", "Next week");
 		this.registerDomEvent(nextButton, "click", () => {
 			this.selectedDate = format(addDays(parseDateAsLocal(this.selectedDate), 7), "yyyy-MM-dd");
 			void this.refresh();
@@ -1161,20 +1162,18 @@ export class DashboardView extends ItemView {
 	}
 
 	private formatPlannerWeekRange(startDate: string, endDate: string): string {
+		const selected = parseDateAsLocal(this.selectedDate);
 		const start = parseDateAsLocal(startDate);
 		const end = parseDateAsLocal(endDate);
-		const sameMonth = format(start, "yyyy-MM") === format(end, "yyyy-MM");
-		const sameYear = format(start, "yyyy") === format(end, "yyyy");
+		const selectedMonthStart = startOfMonth(selected);
+		const weekNumber = start < selectedMonthStart ? 0 : Math.min(4, Math.floor((start.getDate() - 1) / 7) + 1);
+		const monthYear = format(selected, "LLLL yyyy");
+		const rangeLabel =
+			format(start, "yyyy-MM") === format(end, "yyyy-MM")
+				? `${format(start, "d")} - ${format(end, "d MMM")}`
+				: `${format(start, "d MMM")} - ${format(end, "d MMM")}`;
 
-		if (sameMonth) {
-			return `Week ${format(start, "d")} - ${format(end, "d MMM yyyy")}`;
-		}
-
-		if (sameYear) {
-			return `Week ${format(start, "d MMM")} - ${format(end, "d MMM yyyy")}`;
-		}
-
-		return `Week ${format(start, "d MMM yyyy")} - ${format(end, "d MMM yyyy")}`;
+		return `Week #${weekNumber} · ${rangeLabel} · ${monthYear}`;
 	}
 
 	private getAllPlannerTasksForFocus(): TaskInfo[] {
