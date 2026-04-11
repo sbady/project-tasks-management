@@ -52,6 +52,7 @@ import { PomodoroService } from "../services/PomodoroService";
 import { AutoExportService } from "../services/AutoExportService";
 import { ProjectRepository } from "../projects/ProjectRepository";
 import { ProjectService } from "../projects/ProjectService";
+import { ProjectCanvasService } from "../services/ProjectCanvasService";
 import { GoalRepository } from "../goals/GoalRepository";
 import { GoalPeriodService } from "../goals/GoalPeriodService";
 import { GoalService } from "../goals/GoalService";
@@ -116,6 +117,7 @@ export async function initializeCoreServices(plugin: TaskNotesPlugin): Promise<v
 	plugin.goalPeriodService = new GoalPeriodService();
 	plugin.projectRepository = new ProjectRepository(plugin.app, plugin.settings);
 	plugin.projectService = new ProjectService(plugin);
+	plugin.projectCanvasService = new ProjectCanvasService(plugin);
 	plugin.goalRepository = new GoalRepository(
 		plugin.app,
 		plugin.settings,

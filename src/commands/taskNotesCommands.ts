@@ -91,6 +91,13 @@ export function createTaskNotesCommandDefinitions(
 			},
 		},
 		{
+			id: "create-project-canvas",
+			nameKey: "Create project canvas",
+			callback: (ctx) => {
+				ctx.createCurrentProjectCanvas();
+			},
+		},
+		{
 			id: "create-goal",
 			nameKey: "Create goal",
 			callback: (ctx) => {

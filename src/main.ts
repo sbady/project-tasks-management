@@ -34,6 +34,7 @@ import { TaskCreationModal } from "./modals/TaskCreationModal";
 import { TaskEditModal } from "./modals/TaskEditModal";
 import { ProjectCreationModal } from "./modals/ProjectCreationModal";
 import { ProjectEditModal } from "./modals/ProjectEditModal";
+import { ProjectSelectModal } from "./modals/ProjectSelectModal";
 import { GoalCreationModal } from "./modals/GoalCreationModal";
 import { GoalEditModal } from "./modals/GoalEditModal";
 import { openTaskSelector } from "./modals/TaskSelectorWithCreateModal";
@@ -77,6 +78,7 @@ import { CalendarProviderRegistry } from "./services/CalendarProvider";
 import { TaskCalendarSyncService } from "./services/TaskCalendarSyncService";
 import { ProjectRepository } from "./projects/ProjectRepository";
 import { ProjectService } from "./projects/ProjectService";
+import { ProjectCanvasService } from "./services/ProjectCanvasService";
 import { GoalRepository } from "./goals/GoalRepository";
 import { GoalPeriodService } from "./goals/GoalPeriodService";
 import { GoalService } from "./goals/GoalService";
@@ -138,6 +140,7 @@ export default class TaskNotesPlugin extends Plugin {
 	viewPerformanceService: ViewPerformanceService;
 	projectRepository: ProjectRepository;
 	projectService: ProjectService;
+	projectCanvasService: ProjectCanvasService;
 	goalRepository: GoalRepository;
 	goalPeriodService: GoalPeriodService;
 	goalService: GoalService;
@@ -1243,6 +1246,29 @@ export default class TaskNotesPlugin extends Plugin {
 		}
 
 		this.openProjectEditModal(activeProject);
+	}
+
+	createCurrentProjectCanvas(): void {
+		const activeProject = this.getActiveProjectInfo();
+		if (activeProject) {
+			void this.projectCanvasService.openProjectCanvas(activeProject);
+			return;
+		}
+
+		new ProjectSelectModal(this.app, this, (file) => {
+			if (!(file instanceof TFile)) {
+				new Notice("Selected item is not a project note.");
+				return;
+			}
+
+			const project = this.projectRepository.getProject(file.path);
+			if (!project) {
+				new Notice("Selected note is not a project.");
+				return;
+			}
+
+			void this.projectCanvasService.openProjectCanvas(project);
+		}).open();
 	}
 
 	openGoalCreationModal(initialValues?: Partial<GoalCreationData>): void {
