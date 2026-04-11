@@ -4,7 +4,7 @@ import { StatusConfig } from "../types";
  * Service for managing custom task statuses
  */
 export class StatusManager {
-	constructor(private statuses: StatusConfig[], private defaultStatus: string = "open") {}
+	constructor(private statuses: StatusConfig[], private defaultStatus: string = "backlog") {}
 
 	/**
 	 * Get next status in cycle from current status

@@ -1310,12 +1310,13 @@ export class TaskCreationModal extends TaskModal {
 			tagList.push(this.plugin.settings.taskTag);
 		}
 
+		const status = this.status === "backlog" && this.scheduledDate ? "planned" : this.status;
 		const taskData: TaskCreationData = {
 			title: this.title.trim(),
 			due: this.dueDate || undefined,
 			scheduled: this.scheduledDate || undefined,
 			priority: this.priority,
-			status: this.status,
+			status,
 			contexts: contextList.length > 0 ? contextList : undefined,
 			projects: projectList.length > 0 ? projectList : undefined,
 			tags: tagList.length > 0 ? tagList : undefined,
@@ -1369,7 +1370,7 @@ export class TaskCreationModal extends TaskModal {
 	private generateFilename(taskData: TaskCreationData): string {
 		const context: FilenameContext = {
 			title: taskData.title || "",
-			status: taskData.status || "open",
+			status: taskData.status || this.plugin.settings.defaultTaskStatus || "backlog",
 			priority: taskData.priority || "normal",
 			dueDate: taskData.due,
 			scheduledDate: taskData.scheduled,

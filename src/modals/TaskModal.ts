@@ -421,7 +421,7 @@ export abstract class TaskModal extends Modal {
 	protected dueDate = "";
 	protected scheduledDate = "";
 	protected priority = "normal";
-	protected status = "open";
+	protected status = "backlog";
 	protected contexts = "";
 	protected projects = "";
 	protected tags = "";
@@ -1387,7 +1387,7 @@ export abstract class TaskModal extends Modal {
 			const sortedStatuses = [...statusConfigs].sort((a, b) => a.order - b.order);
 			return sortedStatuses[0].value;
 		}
-		return "open"; // fallback
+		return "backlog"; // fallback
 	}
 
 	protected getDefaultPriority(): string {

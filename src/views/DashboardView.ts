@@ -7,6 +7,7 @@ import {
 	DASHBOARD_VIEW_TYPE,
 	type DashboardCaptureOption,
 	type DashboardData,
+	type DashboardBacklogProjectGroup,
 	type DashboardGoalGroupsPayload,
 	type DashboardGoalProgressItem,
 	type DashboardPlannerDayGroup,
@@ -476,6 +477,7 @@ export class DashboardView extends ItemView {
 					{ value: "today", label: "Today" },
 					{ value: "week", label: "Week" },
 					{ value: "calendar", label: "Calendar" },
+					{ value: "backlog", label: "Backlog" },
 				],
 				this.plannerMode,
 				(value) => {
@@ -574,6 +576,11 @@ export class DashboardView extends ItemView {
 			return;
 		}
 
+		if (this.plannerMode === "backlog") {
+			this.renderBacklogPlanner(section, this.dashboardData.planner.backlogGroups);
+			return;
+		}
+
 		this.renderCalendarPlanner(section);
 	}
 
@@ -609,6 +616,86 @@ export class DashboardView extends ItemView {
 			const dayList = dayBlock.createDiv({ cls: "dashboard-v2__task-stream" });
 			this.renderPlannerTaskCards(dayList, group.tasks, parseDateAsLocal(group.date));
 		}
+	}
+
+	private renderBacklogPlanner(container: HTMLElement, groups: DashboardBacklogProjectGroup[]): void {
+		const visibleGroups = groups
+			.map((group) => ({
+				...group,
+				tasks: this.preparePlannerTasks(group.tasks),
+			}))
+			.filter((group) => group.tasks.length > 0);
+
+		if (visibleGroups.length === 0) {
+			container.createEl("p", { cls: "dashboard-v2__empty", text: "Backlog is clear for now." });
+			return;
+		}
+
+		const stream = container.createDiv({ cls: "dashboard-v2__backlog-stream" });
+		for (const group of visibleGroups) {
+			const projectBlock = stream.createDiv({ cls: "dashboard-v2__backlog-project" });
+			const header = projectBlock.createDiv({ cls: "dashboard-v2__backlog-project-header" });
+			header.createDiv({ cls: "dashboard-v2__day-title", text: group.projectTitle });
+			header.createDiv({ cls: "dashboard-v2__pill", text: String(group.tasks.length) });
+
+			const taskList = projectBlock.createDiv({ cls: "dashboard-v2__backlog-list" });
+			for (const task of group.tasks) {
+				this.renderBacklogTask(taskList, task);
+			}
+		}
+	}
+
+	private renderBacklogTask(container: HTMLElement, task: TaskInfo): void {
+		const row = container.createDiv({ cls: "dashboard-v2__backlog-task" });
+		const cardWrap = row.createDiv({ cls: "dashboard-v2__backlog-task-card" });
+		this.renderPlannerTaskCards(cardWrap, [task], parseDateAsLocal(this.dashboardData?.currentDate || getTodayString()));
+
+		const actions = row.createDiv({ cls: "dashboard-v2__backlog-actions" });
+		const todayButton = actions.createEl("button", {
+			cls: "dashboard-v2__subtle-button",
+			text: "Сегодня",
+			attr: { "aria-label": `Plan ${task.title} for today` },
+		});
+		this.registerDomEvent(todayButton, "click", () => {
+			void this.planBacklogTask(task, getTodayString());
+		});
+
+		const tomorrowButton = actions.createEl("button", {
+			cls: "dashboard-v2__subtle-button",
+			text: "Завтра",
+			attr: { "aria-label": `Plan ${task.title} for tomorrow` },
+		});
+		this.registerDomEvent(tomorrowButton, "click", () => {
+			const tomorrow = format(addDays(parseDateAsLocal(getTodayString()), 1), "yyyy-MM-dd");
+			void this.planBacklogTask(task, tomorrow);
+		});
+
+		const chooseButton = actions.createEl("button", {
+			cls: "dashboard-v2__subtle-button",
+			text: "Выбрать дату",
+			attr: { "aria-label": `Choose plan date for ${task.title}` },
+		});
+		this.registerDomEvent(chooseButton, "click", () => {
+			void this.chooseBacklogTaskDate(task);
+		});
+
+		const workButton = actions.createEl("button", {
+			cls: "dashboard-v2__subtle-button",
+			text: "В работу",
+			attr: { "aria-label": `Move ${task.title} to work` },
+		});
+		this.registerDomEvent(workButton, "click", () => {
+			void this.updateBacklogTask(task, { status: "in_progress" });
+		});
+
+		const openButton = actions.createEl("button", {
+			cls: "dashboard-v2__subtle-button",
+			text: "Открыть",
+			attr: { "aria-label": `Open ${task.title}` },
+		});
+		this.registerDomEvent(openButton, "click", () => {
+			void this.openPath(task.path);
+		});
 	}
 
 	private renderPlannerWeekHeader(container: HTMLElement): void {
@@ -1169,6 +1256,7 @@ export class DashboardView extends ItemView {
 			title,
 			projects,
 			relatedNotes,
+			status: "backlog",
 			creationContext: "manual-creation",
 		});
 		await this.plugin.goalService.syncTaskGoal(result.file.path, this.captureGoal || undefined);
@@ -1176,6 +1264,36 @@ export class DashboardView extends ItemView {
 		this.captureProject = "";
 		this.captureGoal = "";
 		await this.openPath(result.file.path);
+		await this.refresh();
+	}
+
+	private async planBacklogTask(task: TaskInfo, scheduled: string): Promise<void> {
+		await this.updateBacklogTask(task, {
+			status: "planned",
+			scheduled,
+		});
+	}
+
+	private async chooseBacklogTaskDate(task: TaskInfo): Promise<void> {
+		const { DateTimePickerModal } = await import("../modals/DateTimePickerModal");
+		const { getDatePart, getTimePart, combineDateAndTime } = await import("../utils/dateUtils");
+		const currentValue = task.scheduled || "";
+		const modal = new DateTimePickerModal(this.app, {
+			currentDate: getDatePart(currentValue) || null,
+			currentTime: getTimePart(currentValue) || null,
+			onSelect: async (date, time) => {
+				const value = date && time ? combineDateAndTime(date, time) : date || undefined;
+				if (!value) {
+					return;
+				}
+				await this.planBacklogTask(task, value);
+			},
+		});
+		modal.open();
+	}
+
+	private async updateBacklogTask(task: TaskInfo, updates: Partial<TaskInfo>): Promise<void> {
+		await this.plugin.taskService.updateTask(task, updates);
 		await this.refresh();
 	}
 

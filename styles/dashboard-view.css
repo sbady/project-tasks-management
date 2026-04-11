@@ -46,6 +46,8 @@
 .dashboard-v2__focus-content,
 .dashboard-v2__goal-list,
 .dashboard-v2__task-stream,
+.dashboard-v2__backlog-stream,
+.dashboard-v2__backlog-list,
 .dashboard-v2__week-stream,
 .dashboard-v2__project-list {
 	display: flex;
@@ -299,6 +301,8 @@
 
 .dashboard-v2__goal-item,
 .dashboard-v2__task-row,
+.dashboard-v2__backlog-project,
+.dashboard-v2__backlog-task,
 .dashboard-v2__project-row,
 .dashboard-v2__day-block,
 .dashboard-v2__metric {
@@ -478,6 +482,35 @@
 	align-items: center;
 	justify-content: space-between;
 	margin-bottom: 8px;
+}
+
+.dashboard-v2__backlog-project-header {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 10px;
+	margin-bottom: 8px;
+}
+
+.dashboard-v2__backlog-task {
+	display: grid;
+	grid-template-columns: minmax(0, 1fr) auto;
+	align-items: start;
+	gap: 10px;
+	padding: 8px;
+}
+
+.dashboard-v2__backlog-task-card {
+	min-width: 0;
+}
+
+.dashboard-v2__backlog-actions {
+	display: flex;
+	align-items: center;
+	justify-content: flex-end;
+	gap: 6px;
+	flex-wrap: wrap;
+	max-width: 360px;
 }
 
 .dashboard-v2__calendar-title {
@@ -685,6 +718,15 @@
 
 	.dashboard-v2__task-row {
 		grid-template-columns: 1fr;
+	}
+
+	.dashboard-v2__backlog-task {
+		grid-template-columns: 1fr;
+	}
+
+	.dashboard-v2__backlog-actions {
+		justify-content: flex-start;
+		max-width: none;
 	}
 
 	.dashboard-v2__task-meta,

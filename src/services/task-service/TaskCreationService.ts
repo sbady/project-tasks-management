@@ -54,7 +54,7 @@ export class TaskCreationService {
 				? this.deps.sanitizeTitleForFilename(taskData.title.trim())
 				: this.deps.sanitizeTitleForStorage(taskData.title.trim());
 			const priority = taskData.priority || plugin.settings.defaultTaskPriority;
-			const status = taskData.status || plugin.settings.defaultTaskStatus;
+			const status = taskData.status || (taskData.scheduled ? "planned" : "backlog");
 			const dateCreated = taskData.dateCreated || getCurrentTimestamp();
 			const dateModified = taskData.dateModified || getCurrentTimestamp();
 

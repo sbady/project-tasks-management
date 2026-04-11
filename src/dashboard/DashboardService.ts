@@ -17,6 +17,7 @@ import type {
 	DashboardActiveProjectsPayload,
 	DashboardCaptureOption,
 	DashboardData,
+	DashboardBacklogProjectGroup,
 	DashboardDeadlinesPayload,
 	DashboardFocusPayload,
 	DashboardGoalGroupsPayload,
@@ -70,9 +71,10 @@ export class DashboardService {
 		const quarterDescriptor = this.plugin.goalPeriodService.getPeriodDescriptor("quarter", today);
 		const tasks = await this.plugin.cacheManager.getAllTasks();
 		const incompleteTasks = tasks.filter((task) => !this.isTaskCompleted(task));
-		const todayTasks = this.getTasksForDate(incompleteTasks, today);
+		const activeTasks = incompleteTasks.filter((task) => task.status !== "backlog");
+		const todayTasks = this.getTasksForDate(activeTasks, today);
 		const plannerWeekStart = startOfWeek(plannerReferenceDate, { weekStartsOn: 1 });
-		const weekGroups = this.buildWeekGroups(incompleteTasks, plannerWeekStart);
+		const weekGroups = this.buildWeekGroups(activeTasks, plannerWeekStart);
 		const currentGoals = {
 			week: this.plugin.goalRepository.listGoalsForPeriod("week", weekDescriptor.periodKey),
 			month: this.plugin.goalRepository.listGoalsForPeriod("month", monthDescriptor.periodKey),
@@ -106,6 +108,7 @@ export class DashboardService {
 			planner: {
 				todayTasks,
 				weekGroups,
+				backlogGroups: this.buildBacklogGroups(incompleteTasks),
 				calendar: this.buildCalendarPayload(tasks, selectedDate),
 			},
 			projectsBoard: this.buildProjectsBoardPayload(tasks, today),
@@ -425,9 +428,9 @@ export class DashboardService {
 		const monthStart = startOfMonth(calendarDate);
 		const monthEnd = endOfMonth(calendarDate);
 		const markers: Record<string, number> = {};
-		const incompleteTasks = tasks.filter((task) => !this.isTaskCompleted(task));
+		const incompleteTasks = tasks.filter((task) => !this.isTaskCompleted(task) && task.status !== "backlog");
 
-		for (const task of tasks) {
+		for (const task of incompleteTasks) {
 			for (const taskDate of [task.scheduled, task.due]) {
 				const parsed = this.parseTaskDate(taskDate);
 				if (!parsed) continue;
@@ -494,6 +497,48 @@ export class DashboardService {
 			blockedTaskCount,
 			dueSoonTaskCount,
 		};
+	}
+
+	private buildBacklogGroups(tasks: TaskInfo[]): DashboardBacklogProjectGroup[] {
+		const backlogTasks = tasks.filter((task) => task.status === "backlog");
+		const groups = new Map<string, DashboardBacklogProjectGroup>();
+
+		for (const task of backlogTasks) {
+			const project = this.getTaskPrimaryProject(task);
+			const projectPath = project?.path ?? "";
+			const projectTitle = project?.title ?? "No project";
+
+			if (!groups.has(projectPath)) {
+				groups.set(projectPath, {
+					projectPath,
+					projectTitle,
+					tasks: [],
+				});
+			}
+
+			groups.get(projectPath)!.tasks.push(task);
+		}
+
+		return [...groups.values()]
+			.map((group) => ({
+				...group,
+				tasks: this.sortTasksByPriorityAndDate(group.tasks),
+			}))
+			.sort((left, right) => {
+				if (left.projectPath === "" && right.projectPath !== "") return 1;
+				if (right.projectPath === "" && left.projectPath !== "") return -1;
+				return left.projectTitle.localeCompare(right.projectTitle);
+			});
+	}
+
+	private getTaskPrimaryProject(task: TaskInfo): ProjectInfo | null {
+		const projectLink = task.projects?.[0];
+		if (!projectLink) {
+			return null;
+		}
+
+		const projectPath = this.resolveProjectPath(projectLink);
+		return this.plugin.projectRepository.getProject(projectPath) ?? null;
 	}
 
 	private isTaskCompleted(task: TaskInfo): boolean {

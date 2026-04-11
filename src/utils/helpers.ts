@@ -315,7 +315,7 @@ export function extractTaskInfo(
 	const filename = path.split("/").pop()?.replace(".md", "") || "Untitled";
 	return {
 		title: filename,
-		status: defaultStatus || "open",
+		status: defaultStatus || "backlog",
 		priority: "normal",
 		path,
 		archived: false,

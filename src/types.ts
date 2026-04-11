@@ -605,7 +605,7 @@ export interface DashboardQuickActionsPayload {
 
 export type DashboardProgressScope = "today" | "week";
 
-export type DashboardPlannerMode = "today" | "week" | "calendar";
+export type DashboardPlannerMode = "today" | "week" | "calendar" | "backlog";
 
 export type DashboardGoalScope = "today" | "week" | "month";
 
@@ -642,6 +642,12 @@ export interface DashboardGoalGroupsPayload {
 export interface DashboardPlannerDayGroup {
 	date: string;
 	label: string;
+	tasks: TaskInfo[];
+}
+
+export interface DashboardBacklogProjectGroup {
+	projectPath: string;
+	projectTitle: string;
 	tasks: TaskInfo[];
 }
 
@@ -689,6 +695,7 @@ export interface DashboardData {
 	planner: {
 		todayTasks: TaskInfo[];
 		weekGroups: DashboardPlannerDayGroup[];
+		backlogGroups: DashboardBacklogProjectGroup[];
 		calendar: DashboardMiniCalendarPayload;
 	};
 	projectsBoard: DashboardProjectsPayload;
