@@ -139,7 +139,7 @@ export class DashboardView extends ItemView {
 	private renderHeader(container: HTMLElement): void {
 		const header = container.createDiv({ cls: "dashboard-v2__header" });
 		const copy = header.createDiv({ cls: "dashboard-v2__header-copy" });
-		copy.createEl("h1", { cls: "dashboard-v2__title", text: "Knowledge Base Agent Core (KVAS)" });
+		copy.createEl("h1", { cls: "dashboard-v2__title", text: "Knowledge Base Agent Core (KBAC)" });
 		copy.createEl("p", {
 			cls: "dashboard-v2__subtitle",
 			text: "A calm command center for KB-backed planning, artifacts, and execution.",

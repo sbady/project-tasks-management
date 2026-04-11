@@ -1,0 +1,3 @@
+display_name: Knowledge Base Agent Core
+short_description: Operate and customize the KBAC Obsidian plugin.
+default_prompt: Use this skill when working inside the KBAC Obsidian plugin, including projects/goals/tasks, planning modes, backlog workflow, and safe customization points in the codebase.
